@@ -17,6 +17,8 @@ pub struct Config {
     pub electrum: ElectrumConfig,
     #[serde(default)]
     pub claim: ClaimConfig,
+    #[serde(default)]
+    pub reconciler: ReconcilerConfig,
     #[serde(skip)]
     pub database_url: String,
     #[serde(skip)]
@@ -80,6 +82,57 @@ impl Default for ClaimConfig {
 fn default_max_claim_attempts() -> i32 {
     DEFAULT_MAX_CLAIM_ATTEMPTS
 }
+
+// --- Reconciler ---
+
+const DEFAULT_RECONCILER_INTERVAL_SECS: u64 = 90;
+const DEFAULT_RECONCILER_MIN_AGE_SECS: u64 = 60;
+const DEFAULT_RECONCILER_MAX_PER_TICK: u32 = 200;
+const DEFAULT_RECONCILER_INTER_CALL_DELAY_MS: u64 = 50;
+
+/// Reconciler task config. The reconciler periodically polls Boltz's
+/// `GET /swap/{id}` for every non-terminal `swap_records` row and
+/// reconciles our DB state against Boltz's view. Catches dropped
+/// webhooks (Boltz abandons after 5 retries × 60s = ~5 min) and
+/// state-machine surprises.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReconcilerConfig {
+    /// Tick cadence. 90s by default — chosen so a dropped webhook is
+    /// caught within ~1.5 min of Boltz abandoning delivery, well inside
+    /// any on-chain claim window.
+    #[serde(default = "default_reconciler_interval_secs")]
+    pub interval_secs: u64,
+    /// Skip rows newer than this. Avoids racing the webhook handler on
+    /// freshly-created swaps where the webhook is still in transit.
+    #[serde(default = "default_reconciler_min_age_secs")]
+    pub min_age_secs: u64,
+    /// Cap per-tick scan size. Caps Boltz API RPM at backlog peak
+    /// (e.g., the first tick after a long downtime). Drains over
+    /// multiple ticks, oldest-first.
+    #[serde(default = "default_reconciler_max_per_tick")]
+    pub max_per_tick: u32,
+    /// Defensive inter-call delay (ms) between Boltz API calls within a
+    /// single tick. With max_per_tick=200 and 50ms, peak RPM is ~133 —
+    /// well below any reasonable rate limit.
+    #[serde(default = "default_reconciler_inter_call_delay_ms")]
+    pub inter_call_delay_ms: u64,
+}
+
+impl Default for ReconcilerConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: DEFAULT_RECONCILER_INTERVAL_SECS,
+            min_age_secs: DEFAULT_RECONCILER_MIN_AGE_SECS,
+            max_per_tick: DEFAULT_RECONCILER_MAX_PER_TICK,
+            inter_call_delay_ms: DEFAULT_RECONCILER_INTER_CALL_DELAY_MS,
+        }
+    }
+}
+
+fn default_reconciler_interval_secs() -> u64 { DEFAULT_RECONCILER_INTERVAL_SECS }
+fn default_reconciler_min_age_secs() -> u64 { DEFAULT_RECONCILER_MIN_AGE_SECS }
+fn default_reconciler_max_per_tick() -> u32 { DEFAULT_RECONCILER_MAX_PER_TICK }
+fn default_reconciler_inter_call_delay_ms() -> u64 { DEFAULT_RECONCILER_INTER_CALL_DELAY_MS }
 
 // --- Pricer config ---
 

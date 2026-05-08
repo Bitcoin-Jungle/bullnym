@@ -734,6 +734,105 @@ pub async fn record_claim_failure(
     Ok(outcome)
 }
 
+/// Compact projection of a `swap_records` row used by the reconciler
+/// to decide its next action. The reconciler does not need full
+/// SwapRecord (no preimage, no boltz_response_json) — keeping the
+/// projection minimal cuts per-tick bytes pulled from the DB and makes
+/// it easy to reason about what the reconciler can and cannot see.
+#[derive(Debug, Clone)]
+pub struct ReconcilerSwap {
+    pub id: Uuid,
+    pub boltz_swap_id: String,
+    pub status: String,
+    pub cooperative_refused: bool,
+    pub claim_txid: Option<String>,
+    pub nym: String,
+    pub amount_sat: i64,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ReconcilerSwap {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            id: row.try_get("id")?,
+            boltz_swap_id: row.try_get("boltz_swap_id")?,
+            status: row.try_get("status")?,
+            cooperative_refused: row.try_get("cooperative_refused")?,
+            claim_txid: row.try_get("claim_txid")?,
+            nym: row.try_get("nym")?,
+            amount_sat: row.try_get("amount_sat")?,
+        })
+    }
+}
+
+/// Reconciler scan: every non-terminal swap older than `min_age_secs`,
+/// oldest-`updated_at`-first, capped at `limit`.
+///
+/// `min_age_secs` skips fresh rows so we don't race the webhook
+/// handler on a swap that's still mid-flight. `limit` bounds peak
+/// Boltz API RPM during backlog drain.
+pub async fn list_non_terminal_swaps_oldest_first(
+    pool: &PgPool,
+    min_age_secs: u64,
+    limit: u32,
+) -> Result<Vec<ReconcilerSwap>, sqlx::Error> {
+    sqlx::query_as::<_, ReconcilerSwap>(
+        "SELECT id, boltz_swap_id, status, cooperative_refused, claim_txid, \
+                nym, amount_sat \
+         FROM swap_records \
+         WHERE status NOT IN ('claimed', 'expired', 'lockup_refunded', 'claim_stuck') \
+           AND updated_at < NOW() - ($1 || ' seconds')::interval \
+         ORDER BY updated_at ASC \
+         LIMIT $2",
+    )
+    .bind(min_age_secs as i64)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+}
+
+/// Schedule an immediate retry from the reconciler. Sets
+/// `next_claim_attempt_at = NOW()` so the next sweep tick (≤30s) picks
+/// up the row. Forward-only: terminal-state guard prevents the
+/// reconciler from "un-finishing" a row that completed concurrently.
+///
+/// Does not change `status`. Used when the reconciler observes that
+/// Boltz still considers the swap claimable but our row hasn't been
+/// retried recently (e.g., a permanent-looking error that was actually
+/// transient).
+pub async fn schedule_immediate_claim(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE swap_records \
+         SET next_claim_attempt_at = NOW(), updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Combined reconciler action for the `swap.expired` (Boltz wall-clock
+/// timer) case. Flips `cooperative_refused = TRUE` and schedules an
+/// immediate retry so the next sweep tick takes the script path.
+/// Single transaction for atomicity — the operator is never confused
+/// by "cooperative_refused but not scheduled" or vice versa.
+pub async fn schedule_script_path_retry(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE swap_records \
+         SET cooperative_refused = TRUE, \
+             next_claim_attempt_at = NOW(), \
+             updated_at = NOW() \
+         WHERE id = $1 \
+           AND status NOT IN ('claimed', 'expired', 'claim_stuck', 'lockup_refunded')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Reset retry bookkeeping after a successful claim attempt. Called
 /// from `claim_swap` once `try_broadcast_tx` returns Ok — clears the
 /// last-error fields so operators see "no errors" on a healthy row,

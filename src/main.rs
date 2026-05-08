@@ -12,7 +12,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    boltz, chain_watcher, claimer, config, gc, ip_whitelist, lnurl, nostr, rate_limit, registration,
+    boltz, chain_watcher, claimer, config, gc, ip_whitelist, lnurl, nostr, rate_limit, reconciler,
+    registration,
     utxo::{self, UtxoBackend},
     AppState,
 };
@@ -139,6 +140,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cancel = CancellationToken::new();
     claimer::spawn_background_claimer(pool.clone(), config.clone(), cancel.clone());
+
+    // Reconciler: polls boltz_api.get_swap for every non-terminal swap
+    // older than `min_age_secs` and patches our DB to match Boltz's
+    // view. Closes the dropped-webhook gap (Boltz's webhook delivery
+    // gives up after ~5 min) by querying state directly.
+    reconciler::spawn(
+        pool.clone(),
+        config.boltz.api_url.clone(),
+        Arc::new(config.reconciler.clone()),
+        cancel.clone(),
+    );
+    tracing::info!(
+        "reconciler started (interval={}s, min_age={}s, max_per_tick={})",
+        config.reconciler.interval_secs,
+        config.reconciler.min_age_secs,
+        config.reconciler.max_per_tick,
+    );
 
     // Periodic GC of rate-limit tables. Without this, sliding-window
     // queries get progressively slower as inactive rows accumulate.
