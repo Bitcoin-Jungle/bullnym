@@ -15,16 +15,35 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub electrum: ElectrumConfig,
+    #[serde(default)]
+    pub claim: ClaimConfig,
+    #[serde(default)]
+    pub reconciler: ReconcilerConfig,
     #[serde(skip)]
     pub database_url: String,
     #[serde(skip)]
     pub swap_mnemonic: String,
-    /// HMAC-SHA256 shared secret for Boltz webhook authentication.
-    /// Sourced from `BOLTZ_WEBHOOK_SECRET` env var. When empty, webhook
-    /// HMAC verification is disabled — for legacy compat, but production
-    /// MUST set this.
+    /// URL-path secret for Boltz webhook authentication. Boltz's backend
+    /// (verified at `boltzr/src/webhook/caller.rs`) does NOT sign webhook
+    /// deliveries — there is no HMAC header. The shared secret therefore
+    /// has to live somewhere Boltz already echoes back, and the only
+    /// such place is the webhook URL itself. We register
+    /// `https://{domain}/webhook/boltz/{webhook_url_secret}` with Boltz
+    /// at swap creation time; the handler matches the path segment in
+    /// constant time.
+    ///
+    /// Sourced from `BOLTZ_WEBHOOK_URL_SECRET` env var. When empty,
+    /// authentication is disabled (legacy/dev mode) — production MUST
+    /// set this. Rotation: see the runbook; existing in-flight swaps'
+    /// webhook URLs persist Boltz-side and 404 against a rotated secret.
     #[serde(skip)]
-    pub boltz_webhook_secret: String,
+    pub boltz_webhook_url_secret: String,
+    /// Optional previous URL secret. Accepted in addition to
+    /// `boltz_webhook_url_secret` for the duration of a rotation overlap
+    /// window (so existing swaps' webhooks keep delivering while new
+    /// swaps register the new URL). Empty = no overlap.
+    #[serde(skip)]
+    pub boltz_webhook_url_secret_previous: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -32,6 +51,184 @@ pub struct BoltzConfig {
     pub api_url: String,
     pub electrum_url: String,
 }
+
+// --- Claim retry policy ---
+
+const DEFAULT_MAX_CLAIM_ATTEMPTS: i32 = 30;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaimConfig {
+    /// After this many failed claim attempts, the row transitions to
+    /// `claim_stuck` and is excluded from the background sweep until an
+    /// operator runs the rescue runbook
+    /// (`pay-service/docs/runbook-stuck-swap.md`, added in PR #11).
+    ///
+    /// Default 30 ≈ 24h of trying with the documented backoff
+    /// (30s, 60s, 120s, 300s, 600s, 1800s, 3600s cap). Plenty for any
+    /// transient outage; well past Boltz's `timeoutBlockHeight` for any
+    /// realistic swap.
+    #[serde(default = "default_max_claim_attempts")]
+    pub max_claim_attempts: i32,
+}
+
+impl Default for ClaimConfig {
+    fn default() -> Self {
+        Self {
+            max_claim_attempts: DEFAULT_MAX_CLAIM_ATTEMPTS,
+        }
+    }
+}
+
+fn default_max_claim_attempts() -> i32 {
+    DEFAULT_MAX_CLAIM_ATTEMPTS
+}
+
+// --- Reconciler ---
+
+const DEFAULT_RECONCILER_INTERVAL_SECS: u64 = 90;
+const DEFAULT_RECONCILER_MIN_AGE_SECS: u64 = 60;
+const DEFAULT_RECONCILER_MAX_PER_TICK: u32 = 200;
+const DEFAULT_RECONCILER_INTER_CALL_DELAY_MS: u64 = 50;
+
+/// Reconciler task config. The reconciler periodically polls Boltz's
+/// `GET /swap/{id}` for every non-terminal `swap_records` row and
+/// reconciles our DB state against Boltz's view. Catches dropped
+/// webhooks (Boltz abandons after 5 retries × 60s = ~5 min) and
+/// state-machine surprises.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReconcilerConfig {
+    /// Tick cadence. 90s by default — chosen so a dropped webhook is
+    /// caught within ~1.5 min of Boltz abandoning delivery, well inside
+    /// any on-chain claim window.
+    #[serde(default = "default_reconciler_interval_secs")]
+    pub interval_secs: u64,
+    /// Skip rows newer than this. Avoids racing the webhook handler on
+    /// freshly-created swaps where the webhook is still in transit.
+    #[serde(default = "default_reconciler_min_age_secs")]
+    pub min_age_secs: u64,
+    /// Cap per-tick scan size. Caps Boltz API RPM at backlog peak
+    /// (e.g., the first tick after a long downtime). Drains over
+    /// multiple ticks, oldest-first.
+    #[serde(default = "default_reconciler_max_per_tick")]
+    pub max_per_tick: u32,
+    /// Defensive inter-call delay (ms) between Boltz API calls within a
+    /// single tick. With max_per_tick=200 and 50ms, peak RPM is ~133 —
+    /// well below any reasonable rate limit.
+    #[serde(default = "default_reconciler_inter_call_delay_ms")]
+    pub inter_call_delay_ms: u64,
+}
+
+impl Default for ReconcilerConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: DEFAULT_RECONCILER_INTERVAL_SECS,
+            min_age_secs: DEFAULT_RECONCILER_MIN_AGE_SECS,
+            max_per_tick: DEFAULT_RECONCILER_MAX_PER_TICK,
+            inter_call_delay_ms: DEFAULT_RECONCILER_INTER_CALL_DELAY_MS,
+        }
+    }
+}
+
+fn default_reconciler_interval_secs() -> u64 { DEFAULT_RECONCILER_INTERVAL_SECS }
+fn default_reconciler_min_age_secs() -> u64 { DEFAULT_RECONCILER_MIN_AGE_SECS }
+fn default_reconciler_max_per_tick() -> u32 { DEFAULT_RECONCILER_MAX_PER_TICK }
+fn default_reconciler_inter_call_delay_ms() -> u64 { DEFAULT_RECONCILER_INTER_CALL_DELAY_MS }
+
+// --- Pricer config ---
+
+const DEFAULT_PRICER_URL: &str = "https://api.bullbitcoin.com/public/price";
+const DEFAULT_PRICER_CACHE_TTL_SECS: u64 = 60;
+const DEFAULT_PRICER_REQUEST_TIMEOUT_MS: u64 = 2000;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricerConfig {
+    /// JSON-RPC endpoint for the bullbitcoin API-Pricer. Donation pages
+    /// fetch `getRate` per `display_currency` to embed a fiat conversion
+    /// rate at HTML render time.
+    #[serde(default = "default_pricer_url")]
+    pub url: String,
+    /// In-memory TTL (seconds) for cached rates. A thundering herd of
+    /// donation-page views all share one upstream call within the TTL.
+    #[serde(default = "default_pricer_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// HTTP request timeout (milliseconds) for the upstream call. On
+    /// timeout / error, the donation render falls back to the last-good
+    /// cached rate (if any).
+    #[serde(default = "default_pricer_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+}
+
+impl Default for PricerConfig {
+    fn default() -> Self {
+        Self {
+            url: DEFAULT_PRICER_URL.to_string(),
+            cache_ttl_secs: DEFAULT_PRICER_CACHE_TTL_SECS,
+            request_timeout_ms: DEFAULT_PRICER_REQUEST_TIMEOUT_MS,
+        }
+    }
+}
+
+fn default_pricer_url() -> String { DEFAULT_PRICER_URL.to_string() }
+fn default_pricer_cache_ttl_secs() -> u64 { DEFAULT_PRICER_CACHE_TTL_SECS }
+fn default_pricer_request_timeout_ms() -> u64 { DEFAULT_PRICER_REQUEST_TIMEOUT_MS }
+
+// --- Donation page (Phase 3 image pipeline) ---
+
+const DEFAULT_DONATION_IMAGE_ROOT: &str = "/opt/payservice/data/images";
+const DEFAULT_DONATION_IMAGE_MAX_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+const DEFAULT_DONATION_IMAGE_MAX_DIMENSION: u32 = 10_000;
+const DEFAULT_DONATION_AVATAR_SIZE: u32 = 256;
+const DEFAULT_DONATION_OG_WIDTH: u32 = 1200;
+const DEFAULT_DONATION_OG_HEIGHT: u32 = 630;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DonationConfig {
+    /// Filesystem root for image storage. The handler writes to
+    /// `<image_root_path>/<nym>/<kind>.webp`. nginx serves this directly
+    /// at `location ^~ /img/`. The directory must be writable by the
+    /// pay-service user and readable by nginx.
+    #[serde(default = "default_donation_image_root")]
+    pub image_root_path: String,
+    /// Hard cap on incoming image bytes. Enforced via per-route
+    /// `DefaultBodyLimit` BEFORE the multipart parser runs — bytes never
+    /// enter memory beyond this.
+    #[serde(default = "default_donation_image_max_bytes")]
+    pub image_max_bytes: usize,
+    /// Reject images whose decoded dimensions exceed this in either
+    /// axis. Image-bomb defense: read the header dimensions first
+    /// (cheap), reject before allocating the full pixel buffer.
+    #[serde(default = "default_donation_image_max_dimension")]
+    pub image_max_dimension: u32,
+    /// Output size for resized avatar (square).
+    #[serde(default = "default_donation_avatar_size")]
+    pub avatar_size: u32,
+    /// Output size for resized OG image (1200×630 is the Twitter/Facebook
+    /// summary_large_image standard).
+    #[serde(default = "default_donation_og_width")]
+    pub og_width: u32,
+    #[serde(default = "default_donation_og_height")]
+    pub og_height: u32,
+}
+
+impl Default for DonationConfig {
+    fn default() -> Self {
+        Self {
+            image_root_path: DEFAULT_DONATION_IMAGE_ROOT.to_string(),
+            image_max_bytes: DEFAULT_DONATION_IMAGE_MAX_BYTES,
+            image_max_dimension: DEFAULT_DONATION_IMAGE_MAX_DIMENSION,
+            avatar_size: DEFAULT_DONATION_AVATAR_SIZE,
+            og_width: DEFAULT_DONATION_OG_WIDTH,
+            og_height: DEFAULT_DONATION_OG_HEIGHT,
+        }
+    }
+}
+
+fn default_donation_image_root() -> String { DEFAULT_DONATION_IMAGE_ROOT.to_string() }
+fn default_donation_image_max_bytes() -> usize { DEFAULT_DONATION_IMAGE_MAX_BYTES }
+fn default_donation_image_max_dimension() -> u32 { DEFAULT_DONATION_IMAGE_MAX_DIMENSION }
+fn default_donation_avatar_size() -> u32 { DEFAULT_DONATION_AVATAR_SIZE }
+fn default_donation_og_width() -> u32 { DEFAULT_DONATION_OG_WIDTH }
+fn default_donation_og_height() -> u32 { DEFAULT_DONATION_OG_HEIGHT }
 
 const DEFAULT_POOL_SIZE: u32 = 10;
 const DEFAULT_MIN_SENDABLE_MSAT: u64 = 100_000;
@@ -448,9 +645,15 @@ impl Config {
             .map_err(|_| "SWAP_MNEMONIC environment variable is required")?;
         // Optional in dev / required in prod. When empty, the webhook
         // handler logs a warning on every request and falls back to
-        // unauthenticated mode (legacy behaviour).
-        config.boltz_webhook_secret =
-            std::env::var("BOLTZ_WEBHOOK_SECRET").unwrap_or_default();
+        // unauthenticated mode (legacy behaviour). `BOLTZ_WEBHOOK_SECRET`
+        // is read for backwards-compat — the previous code expected an
+        // HMAC header that Boltz never sends; the value is now reused
+        // as the URL-path secret instead.
+        config.boltz_webhook_url_secret = std::env::var("BOLTZ_WEBHOOK_URL_SECRET")
+            .or_else(|_| std::env::var("BOLTZ_WEBHOOK_SECRET"))
+            .unwrap_or_default();
+        config.boltz_webhook_url_secret_previous =
+            std::env::var("BOLTZ_WEBHOOK_URL_SECRET_PREVIOUS").unwrap_or_default();
 
         config.validate()?;
         Ok(config)

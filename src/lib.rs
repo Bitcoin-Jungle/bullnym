@@ -11,6 +11,7 @@ pub mod ip_whitelist;
 pub mod lnurl;
 pub mod nostr;
 pub mod rate_limit;
+pub mod reconciler;
 pub mod registration;
 pub mod utxo;
 

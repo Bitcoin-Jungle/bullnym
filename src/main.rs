@@ -12,7 +12,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use pay_service::{
-    boltz, chain_watcher, claimer, config, gc, ip_whitelist, lnurl, nostr, rate_limit, registration,
+    boltz, chain_watcher, claimer, config, gc, ip_whitelist, lnurl, nostr, rate_limit, reconciler,
+    registration,
     utxo::{self, UtxoBackend},
     AppState,
 };
@@ -57,13 +58,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("invalid swap mnemonic: {e}"))?;
 
-    let webhook_url = format!("https://{}/webhook/boltz", config.domain);
+    // Boltz does not HMAC-sign webhook deliveries; the only viable
+    // authenticator is the URL itself. New swaps register
+    // `/webhook/boltz/{secret}`; if the secret is unset we register the
+    // legacy unauthenticated path so dev environments still work.
+    let webhook_url = if config.boltz_webhook_url_secret.is_empty() {
+        tracing::warn!(
+            "BOLTZ_WEBHOOK_URL_SECRET unset — registering unauthenticated webhook URL (DEV ONLY)"
+        );
+        format!("https://{}/webhook/boltz", config.domain)
+    } else {
+        format!(
+            "https://{}/webhook/boltz/{}",
+            config.domain, config.boltz_webhook_url_secret
+        )
+    };
     let boltz_service = boltz::BoltzService::new(
         &config.boltz.api_url,
         swap_master_key,
         Some(webhook_url.clone()),
     );
-    tracing::info!("boltz service initialized ({}) webhook={}", config.boltz.api_url, webhook_url);
+    // Log the sanitized URL — never log the secret. Production logs
+    // pipe to multiple sinks; the secret is high-value.
+    tracing::info!(
+        "boltz service initialized ({}) webhook=https://{}/webhook/boltz/{}",
+        config.boltz.api_url,
+        config.domain,
+        if config.boltz_webhook_url_secret.is_empty() { "<unauthenticated>" } else { "<redacted>" }
+    );
 
     // IP whitelist (fail-closed on parse errors — a typo should surface loudly).
     let whitelist = ip_whitelist::IpWhitelist::parse(&config.rate_limit.ip_whitelist)
@@ -117,7 +139,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let cancel = CancellationToken::new();
-    claimer::spawn_background_claimer(pool.clone(), config.clone(), cancel.clone());
+    claimer::spawn_background_claimer(
+        pool.clone(),
+        config.clone(),
+        state.utxo_backend.clone(),
+        cancel.clone(),
+    );
+
+    // Reconciler: polls boltz_api.get_swap for every non-terminal swap
+    // older than `min_age_secs` and patches our DB to match Boltz's
+    // view. Closes the dropped-webhook gap (Boltz's webhook delivery
+    // gives up after ~5 min) by querying state directly.
+    reconciler::spawn(
+        pool.clone(),
+        config.boltz.api_url.clone(),
+        Arc::new(config.reconciler.clone()),
+        cancel.clone(),
+    );
+    tracing::info!(
+        "reconciler started (interval={}s, min_age={}s, max_per_tick={})",
+        config.reconciler.interval_secs,
+        config.reconciler.min_age_secs,
+        config.reconciler.max_per_tick,
+    );
 
     // Periodic GC of rate-limit tables. Without this, sliding-window
     // queries get progressively slower as inactive rows accumulate.
@@ -181,7 +225,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/register", axum::routing::delete(registration::delete_registration))
         .route("/register/lookup", get(registration::lookup_by_npub))
         .route("/api/reservations/:nym", get(registration::list_reservations))
-        .route("/webhook/boltz", post(claimer::webhook))
+        // Two routes during the rotation overlap window:
+        // - `/webhook/boltz/:secret` — authenticated path. Handler verifies
+        //   `:secret` in constant time against the configured current/previous
+        //   secret(s); 404 on mismatch.
+        // - `/webhook/boltz` — legacy unauthenticated path, kept so dev
+        //   environments without a configured secret still function. In
+        //   production the handler refuses to process requests on this
+        //   path when the secret is configured.
+        .route("/webhook/boltz/:secret", post(claimer::webhook_with_secret))
+        .route("/webhook/boltz", post(claimer::webhook_unauthenticated))
         .route("/health", get(health))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
