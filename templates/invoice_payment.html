@@ -332,6 +332,7 @@
             }
 
             function setQrPayload(text) {
+                if (!payloadText || !qrWrap) return;
                 payloadText.textContent = text;
                 qrWrap.innerHTML = '';
                 const img = document.createElement('img');
@@ -341,6 +342,7 @@
             }
 
             function clearQr(message) {
+                if (!payloadText || !qrWrap) return;
                 payloadText.textContent = '—';
                 qrWrap.innerHTML = `<div class="qr-placeholder">${message}</div>`;
             }
@@ -399,15 +401,17 @@
             if (railLightning) railLightning.addEventListener('click', () => setRail('lightning'));
             if (railBtc) railBtc.addEventListener('click', () => setRail('bitcoin'));
             if (railLiquid) railLiquid.addEventListener('click', () => setRail('liquid'));
-            copyBtn.addEventListener('click', async () => {
-                const text = payloadText.textContent;
-                if (!text || text === '—') return;
-                try {
-                    await navigator.clipboard.writeText(text);
-                    copyBtn.textContent = 'Copied';
-                    setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
-                } catch (_) {}
-            });
+            if (copyBtn && payloadText) {
+                copyBtn.addEventListener('click', async () => {
+                    const text = payloadText.textContent;
+                    if (!text || text === '—') return;
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        copyBtn.textContent = 'Copied';
+                        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+                    } catch (_) {}
+                });
+            }
 
             function formatCountdown(targetUnix, label) {
                 const now = Math.floor(Date.now() / 1000);
@@ -474,6 +478,13 @@
                 `;
             }
 
+            function renderInProgressState() {
+                root.dataset.status = 'in_progress';
+                if (statusLine) {
+                    statusLine.textContent = 'Payment detected…';
+                }
+            }
+
             async function pollStatus() {
                 try {
                     const res = await fetch(
@@ -486,6 +497,19 @@
                     currentRateLocksUntilUnix = data.rate_locks_until_unix || 0;
                     currentExpiresAtUnix = data.expires_at_unix || 0;
                     currentRateStale = !!data.rate_stale;
+                    if (TERMINAL_STATUSES.has(data.status)) {
+                        renderTerminalView(
+                            data.status,
+                            data.paid_amount_sat,
+                            data.paid_via
+                        );
+                        return;
+                    }
+                    if (data.status === 'in_progress') {
+                        if (root.dataset.status !== 'in_progress') {
+                            renderInProgressState();
+                        }
+                    }
                     if (data.lightning_pr && data.lightning_pr !== currentLightningPr) {
                         currentLightningPr = data.lightning_pr;
                         if (currentRail === 'lightning') {
@@ -506,14 +530,6 @@
                     }
                     if (amountDisplay) {
                         amountDisplay.textContent = `${currentAmountSat} sat`;
-                    }
-
-                    if (TERMINAL_STATUSES.has(data.status)) {
-                        renderTerminalView(
-                            data.status,
-                            data.paid_amount_sat,
-                            data.paid_via
-                        );
                     }
                 } catch (e) {
                     // Network blip — keep polling.

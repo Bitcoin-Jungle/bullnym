@@ -389,10 +389,18 @@ pub async fn create_anonymous(
     let invoice = db::insert_invoice(&state.db, &new_invoice).await?;
 
     if let Err(e) = create_lightning_offer(&state, &nym, amount_sat as u64, &invoice).await {
-        tracing::warn!(
+        tracing::error!(
             invoice_id = %invoice.id,
-            "eager Lightning offer creation failed (page can retry): {e}",
+            "eager Lightning offer creation failed; checkout invoice will not be returned: {e}",
         );
+        if let Err(cleanup_err) = db::delete_unpaid_invoice_without_swaps(&state.db, invoice.id).await
+        {
+            tracing::error!(
+                invoice_id = %invoice.id,
+                "failed to clean up checkout invoice after Boltz creation failure: {cleanup_err}",
+            );
+        }
+        return Err(e);
     }
 
     Ok(Json(CreateInvoiceResponse { invoice_id: invoice.id }))

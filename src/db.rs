@@ -1860,6 +1860,24 @@ pub async fn get_invoice_by_id(
     .await
 }
 
+/// Best-effort cleanup for checkout creation failures after the invoice row
+/// exists but before any payment offer was returned to the sender.
+pub async fn delete_unpaid_invoice_without_swaps(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM invoices i \
+         WHERE i.id = $1 \
+           AND i.status = 'unpaid' \
+           AND NOT EXISTS (SELECT 1 FROM swap_records s WHERE s.invoice_id = i.id)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+}
+
 /// List invoices for an npub_owner, newest-first, with optional filters.
 ///
 /// `status_filter`: `Some("unpaid"|"paid"|...)` filters by status;
