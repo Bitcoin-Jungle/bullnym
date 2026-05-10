@@ -127,6 +127,8 @@ const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570c
 
 async fn cleanup_db(pool: &PgPool) {
     sqlx::query("DELETE FROM swap_records").execute(pool).await.ok();
+    sqlx::query("DELETE FROM invoices").execute(pool).await.ok();
+    sqlx::query("DELETE FROM donation_pages").execute(pool).await.ok();
     sqlx::query("DELETE FROM users").execute(pool).await.ok();
 }
 
@@ -644,6 +646,177 @@ async fn insert_swap(pool: &PgPool, nym: &str, status: &str, addr_idx: i32) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+async fn create_test_user(pool: &PgPool, nym: &str) -> String {
+    let (npub, _) = sign_registration(nym, TEST_DESCRIPTOR);
+    pay_service::db::create_user(pool, nym, &npub, TEST_DESCRIPTOR)
+        .await
+        .unwrap();
+    npub
+}
+
+async fn insert_test_invoice(
+    pool: &PgPool,
+    nym: &str,
+    npub: &str,
+    liquid_address: &str,
+    expires_in_secs: i64,
+) -> pay_service::db::Invoice {
+    pay_service::db::insert_invoice(
+        pool,
+        &pay_service::db::NewInvoice {
+            nym_owner: Some(nym),
+            npub_owner: npub,
+            origin: "checkout",
+            fiat_amount_minor: None,
+            fiat_currency: None,
+            amount_sat: 1_000,
+            rate_minor_per_btc: None,
+            rate_lock_secs: expires_in_secs,
+            memo: None,
+            recipient_label: None,
+            public_description: None,
+            invoice_number: None,
+            accept_btc: false,
+            accept_ln: false,
+            accept_liquid: true,
+            bitcoin_address: None,
+            liquid_address: Some(liquid_address),
+            expires_in_secs,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+// --- Invoice lifecycle / watcher database coverage ---
+
+#[tokio::test]
+async fn invoice_expiry_gc_marks_only_active_past_deadline_rows() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "invoicegc").await;
+
+    let expired_unpaid =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredunpaid", -10).await;
+    let expired_in_progress =
+        insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredinprogress", -10).await;
+    let expired_paid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1expiredpaid", -10).await;
+    let fresh_unpaid = insert_test_invoice(&pool, "invoicegc", &npub, "lq1freshunpaid", 60).await;
+
+    pay_service::db::mark_invoice_in_progress(&pool, expired_in_progress.id)
+        .await
+        .unwrap();
+    pay_service::db::mark_invoice_paid(&pool, expired_paid.id, 1_000, "liquid")
+        .await
+        .unwrap();
+
+    let expired_count = pay_service::db::expire_invoices_past_deadline(&pool)
+        .await
+        .unwrap();
+    assert_eq!(expired_count, 2);
+
+    let expired_unpaid = pay_service::db::get_invoice_by_id(&pool, expired_unpaid.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let expired_in_progress =
+        pay_service::db::get_invoice_by_id(&pool, expired_in_progress.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let expired_paid = pay_service::db::get_invoice_by_id(&pool, expired_paid.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let fresh_unpaid = pay_service::db::get_invoice_by_id(&pool, fresh_unpaid.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(expired_unpaid.status, "expired");
+    assert_eq!(expired_in_progress.status, "expired");
+    assert_eq!(expired_paid.status, "paid");
+    assert_eq!(fresh_unpaid.status, "unpaid");
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn liquid_address_watcher_scan_excludes_expired_invoice_rows() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "liquidscan").await;
+
+    let expired = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanexpired", -10).await;
+    let fresh = insert_test_invoice(&pool, "liquidscan", &npub, "lq1scanfresh", 60).await;
+
+    let rows = pay_service::db::list_unpaid_invoices_with_liquid_address(&pool)
+        .await
+        .unwrap();
+    let invoice_ids: std::collections::HashSet<_> =
+        rows.into_iter().map(|(id, _, _)| id).collect();
+
+    assert!(!invoice_ids.contains(&expired.id));
+    assert!(invoice_ids.contains(&fresh.id));
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn latest_lightning_pr_for_invoice_uses_newest_swap_row() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let npub = create_test_user(&pool, "latestpr").await;
+    let invoice = insert_test_invoice(&pool, "latestpr", &npub, "lq1latestpr", 60).await;
+
+    pay_service::db::record_swap(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: "latestpr",
+            boltz_swap_id: "latestpr-old",
+            address: Some("lq1latestold"),
+            address_index: Some(0),
+            amount_sat: 1_000,
+            invoice: "lnbc-old",
+            preimage_hex: "aa".repeat(32).as_str(),
+            claim_key_hex: "bb".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE swap_records SET created_at = NOW() - INTERVAL '1 minute' WHERE boltz_swap_id = 'latestpr-old'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    pay_service::db::record_swap(
+        &pool,
+        &pay_service::db::NewSwapRecord {
+            nym: "latestpr",
+            boltz_swap_id: "latestpr-new",
+            address: Some("lq1latestnew"),
+            address_index: Some(1),
+            amount_sat: 1_000,
+            invoice: "lnbc-new",
+            preimage_hex: "cc".repeat(32).as_str(),
+            claim_key_hex: "dd".repeat(32).as_str(),
+            boltz_response_json: "{}",
+            invoice_id: Some(invoice.id),
+        },
+    )
+    .await
+    .unwrap();
+
+    let pr = pay_service::db::latest_lightning_pr_for_invoice(&pool, invoice.id)
+        .await
+        .unwrap();
+    assert_eq!(pr.as_deref(), Some("lnbc-new"));
+
+    cleanup_db(&pool).await;
 }
 
 #[tokio::test]

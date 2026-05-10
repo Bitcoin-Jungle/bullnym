@@ -2631,6 +2631,7 @@ dependencies = [
  "http-body-util",
  "image",
  "ipnet",
+ "lightning-invoice",
  "lwk_wollet",
  "qrcode",
  "regex",

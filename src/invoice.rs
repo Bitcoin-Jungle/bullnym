@@ -30,13 +30,14 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use askama::Template;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use lightning_invoice::Bolt11Invoice;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -71,9 +72,10 @@ const MAX_WALLET_EXPIRES_SECS: i64 = 30 * 24 * 60 * 60;
 /// page size; never larger.
 const LIST_LIMIT_MAX: i64 = 100;
 
-/// Default outer expiry for checkout-origin invoices. Matches the LNURL
-/// reverse-swap timebox; the donator should be done in well under an hour.
-const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = 60 * 60;
+/// Default outer expiry for checkout-origin invoices. Individual Boltz
+/// BOLT11s may expire sooner and are refreshed while the invoice is live;
+/// this cap prevents abandoned checkout invoices from refreshing forever.
+const CHECKOUT_DEFAULT_EXPIRES_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Inner rate-lock window for fiat-denominated invoices. The status
 /// endpoint refreshes the sat amount on the first poll after this elapses.
@@ -241,10 +243,7 @@ fn html_response(html: String) -> Response {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        header::X_FRAME_OPTIONS,
-        HeaderValue::from_static("DENY"),
-    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("strict-origin-when-cross-origin"),
@@ -345,16 +344,13 @@ pub async fn create_anonymous(
     // The `invoices_ln_or_liquid_addr_chk` constraint requires
     // `liquid_address` to be present at insert time when either LN or
     // Liquid is accepted, so allocation must run BEFORE insert.
-    let (liquid_address, _liquid_index) = db::allocate_next_liquid_for_active_nym(
-        &state.db,
-        &nym,
-        |ct_descriptor, idx| {
+    let (liquid_address, _liquid_index) =
+        db::allocate_next_liquid_for_active_nym(&state.db, &nym, |ct_descriptor, idx| {
             descriptor::derive_address(ct_descriptor, idx)
                 .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
-        },
-    )
-    .await?
-    .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
+        })
+        .await?
+        .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
     let new_invoice = db::NewInvoice {
         nym_owner: Some(&nym),
@@ -393,7 +389,8 @@ pub async fn create_anonymous(
             invoice_id = %invoice.id,
             "eager Lightning offer creation failed; checkout invoice will not be returned: {e}",
         );
-        if let Err(cleanup_err) = db::delete_unpaid_invoice_without_swaps(&state.db, invoice.id).await
+        if let Err(cleanup_err) =
+            db::delete_unpaid_invoice_without_swaps(&state.db, invoice.id).await
         {
             tracing::error!(
                 invoice_id = %invoice.id,
@@ -403,7 +400,9 @@ pub async fn create_anonymous(
         return Err(e);
     }
 
-    Ok(Json(CreateInvoiceResponse { invoice_id: invoice.id }))
+    Ok(Json(CreateInvoiceResponse {
+        invoice_id: invoice.id,
+    }))
 }
 
 /// Validate the create-anonymous body and resolve the requested amount.
@@ -442,14 +441,17 @@ async fn parse_create_request(
         return Ok((sat, None));
     }
 
-    let minor = req.fiat_amount_minor.ok_or_else(|| {
-        AppError::InvalidAmount("missing fiat_amount_minor".into())
-    })?;
-    let currency = req.fiat_currency.as_deref().ok_or_else(|| {
-        AppError::InvalidAmount("missing fiat_currency".into())
-    })?;
+    let minor = req
+        .fiat_amount_minor
+        .ok_or_else(|| AppError::InvalidAmount("missing fiat_amount_minor".into()))?;
+    let currency = req
+        .fiat_currency
+        .as_deref()
+        .ok_or_else(|| AppError::InvalidAmount("missing fiat_currency".into()))?;
     if minor <= 0 {
-        return Err(AppError::InvalidAmount("fiat_amount_minor must be > 0".into()));
+        return Err(AppError::InvalidAmount(
+            "fiat_amount_minor must be > 0".into(),
+        ));
     }
     const MAX_FIAT_MINOR: i32 = 1_000_000_000;
     if minor > MAX_FIAT_MINOR {
@@ -580,10 +582,7 @@ pub async fn render_unlinked_payment(
     Ok(html_response(render_invoice_template(&state, &inv)?))
 }
 
-fn render_invoice_template(
-    state: &AppState,
-    inv: &db::Invoice,
-) -> Result<String, AppError> {
+fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<String, AppError> {
     let fiat_display = match (inv.fiat_amount_minor, inv.fiat_currency.as_deref()) {
         (Some(minor), Some(cur)) => Some(format_fiat_major(minor, cur)),
         _ => None,
@@ -682,12 +681,12 @@ pub async fn status(
         }
     }
 
-    let lightning_pr = match db::latest_lightning_pr_for_invoice(&state.db, inv.id).await {
+    let lightning_pr = match ensure_reusable_lightning_offer(&state, &inv).await {
         Ok(opt) => opt,
         Err(e) => {
             tracing::warn!(
                 invoice_id = %inv.id,
-                "failed to fetch latest lightning offer: {e}"
+                "failed to refresh lightning offer for status response: {e}"
             );
             None
         }
@@ -749,9 +748,7 @@ async fn maybe_refresh_rate(
     db::get_invoice_by_id(&state.db, inv.id)
         .await
         .map_err(AppError::from)
-        .and_then(|opt| {
-            opt.ok_or_else(|| AppError::InvoiceNotFound(inv.id.to_string()))
-        })
+        .and_then(|opt| opt.ok_or_else(|| AppError::InvoiceNotFound(inv.id.to_string())))
         .map(Some)
 }
 
@@ -778,10 +775,7 @@ pub async fn fetch_lightning_offer(
 
     if !is_whitelisted {
         if let Some(ip) = ip {
-            state
-                .rate_limiter
-                .check_lightning_per_source(ip)
-                .await?;
+            state.rate_limiter.check_lightning_per_source(ip).await?;
         }
     }
 
@@ -801,21 +795,63 @@ pub async fn fetch_lightning_offer(
         ));
     }
 
-    if let Some(pr) = db::latest_lightning_pr_for_invoice(&state.db, inv.id).await? {
-        return Ok(Json(LightningOfferResponse { pr }));
+    let pr = ensure_reusable_lightning_offer(&state, &inv)
+        .await?
+        .ok_or_else(|| {
+            AppError::InvalidAmount("invoice expired; no Lightning offer available".into())
+        })?;
+    Ok(Json(LightningOfferResponse { pr }))
+}
+
+/// Return the latest still-payable BOLT11 for an invoice, refreshing it
+/// through Boltz when the previous offer has expired. Only fully unpaid
+/// invoices can create a replacement offer; `in_progress` may still
+/// surface an existing reusable BOLT11, but it does not open a new swap.
+/// The outer invoice `expires_at` remains the hard merchant lifetime;
+/// after that deadline, this helper will not create another swap.
+async fn ensure_reusable_lightning_offer(
+    state: &AppState,
+    inv: &db::Invoice,
+) -> Result<Option<String>, AppError> {
+    if !matches!(inv.status.as_str(), "unpaid" | "in_progress") || !inv.accept_ln {
+        return Ok(None);
     }
 
-    let nym = lightning_swap_nym(&state.db, &inv).await?;
-    create_lightning_offer(&state, &nym, inv.amount_sat as u64, &inv).await?;
+    let now = unix_now();
+    if let Some(pr) = db::latest_lightning_pr_for_invoice(&state.db, inv.id).await? {
+        if bolt11_is_reusable_at(&pr, now) {
+            return Ok(Some(pr));
+        }
+        if inv.status != "unpaid" {
+            return Ok(None);
+        }
+        tracing::info!(
+            invoice_id = %inv.id,
+            "latest BOLT11 expired; requesting replacement offer from Boltz",
+        );
+    }
+
+    if inv.status != "unpaid" || inv.expires_at_unix <= now {
+        return Ok(None);
+    }
+
+    let nym = lightning_swap_nym(&state.db, inv).await?;
+    create_lightning_offer(state, &nym, inv.amount_sat as u64, inv).await?;
 
     let pr = db::latest_lightning_pr_for_invoice(&state.db, inv.id)
         .await?
-        .ok_or_else(|| {
-            AppError::BoltzError(
-                "swap created but no BOLT11 row found".into(),
-            )
-        })?;
-    Ok(Json(LightningOfferResponse { pr }))
+        .ok_or_else(|| AppError::BoltzError("swap created but no BOLT11 row found".into()))?;
+    Ok(Some(pr))
+}
+
+fn bolt11_is_reusable_at(pr: &str, now_unix: i64) -> bool {
+    let Ok(now) = u64::try_from(now_unix) else {
+        return false;
+    };
+    let Ok(invoice) = Bolt11Invoice::from_str(pr) else {
+        return false;
+    };
+    !invoice.would_expire(Duration::from_secs(now))
 }
 
 /// Resolve the nym to attribute on the swap_records row for `invoice`.
@@ -835,9 +871,7 @@ async fn lightning_swap_nym(
     let user = db::get_user_by_npub(pool, &invoice.npub_owner)
         .await?
         .ok_or_else(|| {
-            AppError::AuthError(
-                "unlinked invoice's npub has no active registration".into(),
-            )
+            AppError::AuthError("unlinked invoice's npub has no active registration".into())
         })?;
     Ok(user.nym)
 }
@@ -860,14 +894,8 @@ async fn create_lightning_offer(
     // /invoice/<id>. Donator's LN wallet shows the description hash; we
     // bind it to the public invoice URL.
     let description = match invoice.nym_owner.as_deref() {
-        Some(nym) => format!(
-            "https://{}/{}/i/{}",
-            state.config.domain, nym, invoice.id
-        ),
-        None => format!(
-            "https://{}/invoice/{}",
-            state.config.domain, invoice.id
-        ),
+        Some(nym) => format!("https://{}/{}/i/{}", state.config.domain, nym, invoice.id),
+        None => format!("https://{}/invoice/{}", state.config.domain, invoice.id),
     };
     let description_hash_hex = hex::encode(Sha256::digest(description.as_bytes()));
 
@@ -905,9 +933,7 @@ async fn create_lightning_offer(
         },
     )
     .await
-    .map_err(|e| {
-        AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id))
-    })?;
+    .map_err(|e| AppError::DbError(format!("failed to record swap {}: {e}", result.swap_id)))?;
 
     db::touch_user_callback(&state.db, swap_nym).await;
     Ok(())
@@ -958,11 +984,7 @@ pub async fn fetch_liquid_offer(
 
 /// Verify the signing npub owns `nym` AND the user row is currently
 /// active. Used by the linked create/cancel paths.
-async fn assert_nym_owner(
-    state: &AppState,
-    nym: &str,
-    npub: &str,
-) -> Result<db::User, AppError> {
+async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db::User, AppError> {
     let user = db::get_user_by_npub(&state.db, npub)
         .await?
         .ok_or_else(|| AppError::AuthError("no active registration for this key".into()))?;
@@ -1253,8 +1275,7 @@ async fn create_invoice_inner(
 
     if invoice.accept_ln {
         let swap_nym = lightning_swap_nym(&state.db, &invoice).await?;
-        if let Err(e) =
-            create_lightning_offer(state, &swap_nym, amount_sat as u64, &invoice).await
+        if let Err(e) = create_lightning_offer(state, &swap_nym, amount_sat as u64, &invoice).await
         {
             tracing::warn!(
                 invoice_id = %invoice.id,
@@ -1472,10 +1493,17 @@ pub async fn list_signed(
 
     let status_filter: Option<&str> = match params.status.as_deref() {
         None | Some("") => None,
-        Some(s) if matches!(
-            s,
-            "unpaid" | "in_progress" | "paid" | "underpaid" | "overpaid" | "expired" | "cancelled"
-        ) =>
+        Some(s)
+            if matches!(
+                s,
+                "unpaid"
+                    | "in_progress"
+                    | "paid"
+                    | "underpaid"
+                    | "overpaid"
+                    | "expired"
+                    | "cancelled"
+            ) =>
         {
             Some(s)
         }
@@ -1552,16 +1580,34 @@ mod tests {
     #[test]
     fn create_payload_field_order() {
         let f = create_payload_fields(
-            "5000", "", "", "coffee", "Alice", "INV-1",
-            "false", "true", "true",
-            "", "lq1qq...", "1700000000",
+            "5000",
+            "",
+            "",
+            "coffee",
+            "Alice",
+            "INV-1",
+            "false",
+            "true",
+            "true",
+            "",
+            "lq1qq...",
+            "1700000000",
         );
         assert_eq!(
             f,
             [
-                "5000", "", "", "coffee", "Alice", "INV-1",
-                "false", "true", "true",
-                "", "lq1qq...", "1700000000",
+                "5000",
+                "",
+                "",
+                "coffee",
+                "Alice",
+                "INV-1",
+                "false",
+                "true",
+                "true",
+                "",
+                "lq1qq...",
+                "1700000000",
             ],
             "create field order changed — mobile MUST update in lockstep"
         );
@@ -1595,9 +1641,29 @@ mod tests {
     }
 
     #[test]
+    fn checkout_outer_expiry_is_seven_days() {
+        assert_eq!(CHECKOUT_DEFAULT_EXPIRES_SECS, 7 * 24 * 60 * 60);
+    }
+
+    #[test]
     fn npub_log_tag_truncates() {
-        assert_eq!(npub_log_tag("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"), "89abcdef");
+        assert_eq!(
+            npub_log_tag("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "89abcdef"
+        );
         assert_eq!(npub_log_tag("short"), "short");
         assert_eq!(npub_log_tag(""), "");
+    }
+
+    #[test]
+    fn bolt11_reusable_check_uses_embedded_expiry() {
+        // BOLT11 test vector timestamp is 1496314658 with default 3600s
+        // expiry. The helper must reuse it before expiry and reject it
+        // after expiry, independently of the merchant invoice lifetime.
+        let pr = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
+
+        assert!(bolt11_is_reusable_at(pr, 1_496_314_658 + 3_599));
+        assert!(!bolt11_is_reusable_at(pr, 1_496_314_658 + 3_601));
+        assert!(!bolt11_is_reusable_at("not-a-bolt11", 1_496_314_658));
     }
 }
