@@ -123,6 +123,16 @@ pub trait UtxoBackend: Send + Sync {
     /// landing at a nym's next-unused address. (added by chain_watcher)
     async fn has_history(&self, script_pubkey: &elements::Script) -> Result<bool, AppError>;
 
+    /// Find the transaction that spends `(txid:vout)` for a known Liquid
+    /// script. Used by claim recovery when a rebroadcast says already-spent
+    /// but our expected claim txid is absent.
+    async fn find_spending_txid(
+        &self,
+        script_pubkey: &elements::Script,
+        txid_hex: &str,
+        vout: u32,
+    ) -> Result<Option<String>, AppError>;
+
     /// Does a transaction with this txid exist on the Liquid network
     /// (in mempool or confirmed)?
     ///
@@ -440,6 +450,69 @@ impl UtxoBackend for ElectrumClient {
 
         Ok(!history.is_empty())
     }
+
+    async fn find_spending_txid(
+        &self,
+        script_pubkey: &elements::Script,
+        txid_hex: &str,
+        vout: u32,
+    ) -> Result<Option<String>, AppError> {
+        let scripthash_hex = electrum_scripthash_hex(script_pubkey);
+        let target_txid = txid_hex.to_string();
+
+        let state = self.state.clone();
+        let urls = self.urls.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            run_op_blocking(&state, &urls, "scripthash.get_history", |client| {
+                use electrum_client::ElectrumApi;
+                client.raw_call(
+                    "blockchain.scripthash.get_history",
+                    vec![electrum_client::Param::String(scripthash_hex.clone())],
+                )
+            })
+        })
+        .await
+        .map_err(|e| AppError::ElectrumError(format!("join: {e}")))?
+        .map_err(|e| AppError::ElectrumError(format!("scripthash.get_history: {e}")))?;
+
+        for history_txid in history_txids(&result)? {
+            let raw = self.get_raw_tx(&history_txid).await?;
+            let tx: elements::Transaction = elements::encode::deserialize(&raw)
+                .map_err(|e| AppError::ElectrumError(format!("liquid tx decode: {e}")))?;
+            if transaction_spends_outpoint(&tx, &target_txid, vout) {
+                return Ok(Some(tx.txid().to_string()));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+fn history_txids(history: &serde_json::Value) -> Result<Vec<String>, AppError> {
+    let history = history.as_array().ok_or_else(|| {
+        AppError::ElectrumError("scripthash.get_history: expected JSON array response".into())
+    })?;
+
+    history
+        .iter()
+        .map(|entry| {
+            entry
+                .get("tx_hash")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    AppError::ElectrumError(
+                        "scripthash.get_history: entry missing tx_hash".into(),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn transaction_spends_outpoint(tx: &elements::Transaction, txid_hex: &str, vout: u32) -> bool {
+    tx.input.iter().any(|input| {
+        input.previous_output.txid.to_string() == txid_hex && input.previous_output.vout == vout
+    })
 }
 
 /// Electrum scripthash convention: sha256 of the scriptpubkey wire bytes,
@@ -453,7 +526,9 @@ fn electrum_scripthash_hex(script: &elements::Script) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lwk_wollet::elements::hashes::Hash;
     use secp256k1::SecretKey;
+    use serde_json::json;
 
     fn test_keypair() -> (SecretKey, PublicKey) {
         let secp = Secp256k1::new();
@@ -582,5 +657,49 @@ mod tests {
     #[test]
     fn parse_outpoint_bad_txid_len() {
         assert!(ParsedOutpoint::parse("ab:0").is_err());
+    }
+
+    #[test]
+    fn history_txids_extracts_hashes() {
+        let value = json!([
+            {"tx_hash": "a", "height": 0},
+            {"tx_hash": "b", "height": 10}
+        ]);
+        assert_eq!(history_txids(&value).unwrap(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn history_txids_rejects_malformed_shape() {
+        assert!(matches!(
+            history_txids(&json!({"tx_hash": "a"})),
+            Err(AppError::ElectrumError(_))
+        ));
+        assert!(matches!(
+            history_txids(&json!([{"height": 1}])),
+            Err(AppError::ElectrumError(_))
+        ));
+    }
+
+    #[test]
+    fn transaction_spends_exact_outpoint_only() {
+        let target = elements::Txid::from_slice(&[1u8; 32]).unwrap();
+        let other = elements::Txid::from_slice(&[2u8; 32]).unwrap();
+        let tx = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: vec![elements::TxIn {
+                previous_output: elements::OutPoint::new(target, 7),
+                is_pegin: false,
+                script_sig: elements::Script::new(),
+                sequence: elements::Sequence::MAX,
+                asset_issuance: elements::AssetIssuance::default(),
+                witness: elements::TxInWitness::default(),
+            }],
+            output: vec![],
+        };
+
+        assert!(transaction_spends_outpoint(&tx, &target.to_string(), 7));
+        assert!(!transaction_spends_outpoint(&tx, &target.to_string(), 8));
+        assert!(!transaction_spends_outpoint(&tx, &other.to_string(), 7));
     }
 }

@@ -10,6 +10,8 @@ use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use lwk_wollet::elements;
+
 use boltz_client::network::electrum::ElectrumLiquidClient;
 use boltz_client::network::{Chain, LiquidChain};
 use boltz_client::swaps::boltz::{BoltzApiClientV2, CreateReverseResponse};
@@ -804,7 +806,7 @@ async fn claim_swap_inner(
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;
     let chain_client = ChainClient::new().with_liquid(liquid_client);
 
-    let txid = btc_like_txid(&claim_tx);
+    let mut txid = btc_like_txid(&claim_tx);
 
     if let Err(broadcast_err) = chain_client.try_broadcast_tx(&claim_tx).await {
         // `try_broadcast_tx` only swallows `"already in block chain"` /
@@ -830,9 +832,34 @@ async fn claim_swap_inner(
                     // fall through to Phase 3
                 }
                 Ok(false) => {
-                    return Err(AppError::ClaimError(format!(
-                        "broadcast failed: {broadcast_err}"
-                    )));
+                    match recover_claim_from_lockup_spend(&claim_tx, backend).await {
+                        Ok(Some(spending_txid)) => {
+                            tracing::info!(
+                                event = "claim_outspend_recovered",
+                                swap_id = %swap.boltz_swap_id,
+                                expected_txid = %txid,
+                                recovered_txid = %spending_txid,
+                                broadcast_error = %broadcast_err,
+                                "claim broadcast errored and expected txid was absent, but lockup outspend was found"
+                            );
+                            txid = spending_txid;
+                        }
+                        Ok(None) => {
+                            return Err(AppError::ClaimError(format!(
+                                "broadcast failed: {broadcast_err}"
+                            )));
+                        }
+                        Err(recovery_err) => {
+                            tracing::warn!(
+                                "claim outspend recovery failed for {}: {recovery_err}; \
+                                 treating broadcast as failed",
+                                swap.boltz_swap_id
+                            );
+                            return Err(AppError::ClaimError(format!(
+                                "broadcast failed: {broadcast_err}"
+                            )));
+                        }
+                    }
                 }
                 Err(probe_err) => {
                     // Probe itself failed (Electrum hiccup). Conservatively
@@ -1015,9 +1042,69 @@ fn btc_like_txid(tx: &BtcLikeTransaction) -> String {
     }
 }
 
+async fn recover_claim_from_lockup_spend(
+    claim_tx: &BtcLikeTransaction,
+    backend: &Arc<dyn UtxoBackend>,
+) -> Result<Option<String>, AppError> {
+    let BtcLikeTransaction::Liquid(tx) = claim_tx else {
+        return Ok(None);
+    };
+
+    let Some(input) = tx.input.first() else {
+        return Err(AppError::ClaimError(
+            "claim tx has no input for outspend recovery".into(),
+        ));
+    };
+
+    let lockup_txid = input.previous_output.txid.to_string();
+    let lockup_vout = input.previous_output.vout;
+    let raw_lockup = backend.get_raw_tx(&lockup_txid).await?;
+    let lockup_tx: elements::Transaction = elements::encode::deserialize(&raw_lockup)
+        .map_err(|e| AppError::ClaimError(format!("decode lockup tx: {e}")))?;
+    let lockup_output = lockup_tx
+        .output
+        .get(lockup_vout as usize)
+        .ok_or_else(|| AppError::ClaimError(format!("lockup vout {lockup_vout} missing")))?;
+
+    let Some(spending_txid) = backend
+        .find_spending_txid(&lockup_output.script_pubkey, &lockup_txid, lockup_vout)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let raw_spending = backend.get_raw_tx(&spending_txid).await?;
+    let spending_tx: elements::Transaction = elements::encode::deserialize(&raw_spending)
+        .map_err(|e| AppError::ClaimError(format!("decode spending tx: {e}")))?;
+    if !spending_tx_matches_claim_destination(&spending_tx, tx) {
+        return Err(AppError::ClaimError(format!(
+            "lockup spent by {spending_txid}, but spender does not pay the claim destination"
+        )));
+    }
+
+    Ok(Some(spending_txid))
+}
+
+fn spending_tx_matches_claim_destination(
+    spending_tx: &elements::Transaction,
+    claim_tx: &elements::Transaction,
+) -> bool {
+    claim_tx.output.iter().any(|claim_output| {
+        !claim_output.script_pubkey.is_empty()
+            && spending_tx
+                .output
+                .iter()
+                .any(|out| out.script_pubkey == claim_output.script_pubkey)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use elements::encode::serialize;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
 
     #[test]
     fn url_secret_matches_current() {
@@ -1093,6 +1180,164 @@ mod tests {
                 "did not expect refusal classification for: {phrase}"
             );
         }
+    }
+
+    struct MockUtxoBackend {
+        raw_txs: HashMap<String, Vec<u8>>,
+        find_calls: Mutex<Vec<(String, u32)>>,
+        spender: Option<String>,
+    }
+
+    #[async_trait]
+    impl UtxoBackend for MockUtxoBackend {
+        async fn get_raw_tx(&self, txid_hex: &str) -> Result<Vec<u8>, AppError> {
+            self.raw_txs
+                .get(txid_hex)
+                .cloned()
+                .ok_or(AppError::UtxoNotFound)
+        }
+
+        async fn is_unspent(
+            &self,
+            _script_pubkey: &elements::Script,
+            _txid_hex: &str,
+            _vout: u32,
+        ) -> Result<bool, AppError> {
+            Ok(false)
+        }
+
+        async fn has_history(&self, _script_pubkey: &elements::Script) -> Result<bool, AppError> {
+            Ok(false)
+        }
+
+        async fn find_spending_txid(
+            &self,
+            _script_pubkey: &elements::Script,
+            txid_hex: &str,
+            vout: u32,
+        ) -> Result<Option<String>, AppError> {
+            self.find_calls
+                .lock()
+                .await
+                .push((txid_hex.to_string(), vout));
+            Ok(self.spender.clone())
+        }
+    }
+
+    fn test_liquid_tx(
+        input_outpoint: Option<elements::OutPoint>,
+        script_pubkey: elements::Script,
+    ) -> elements::Transaction {
+        let input = input_outpoint.map(|previous_output| elements::TxIn {
+            previous_output,
+            is_pegin: false,
+            script_sig: elements::Script::new(),
+            sequence: elements::Sequence::MAX,
+            asset_issuance: elements::AssetIssuance::default(),
+            witness: elements::TxInWitness::default(),
+        });
+
+        elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: input.into_iter().collect(),
+            output: vec![elements::TxOut {
+                asset: elements::confidential::Asset::Explicit(elements::AssetId::LIQUID_BTC),
+                value: elements::confidential::Value::Explicit(10_000),
+                nonce: elements::confidential::Nonce::Null,
+                script_pubkey,
+                witness: elements::TxOutWitness::default(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_claim_from_lockup_spend_returns_discovered_spender() {
+        let claim_script = elements::Script::from(vec![0x51]);
+        let lockup_tx = test_liquid_tx(None, elements::Script::new());
+        let lockup_txid = lockup_tx.txid();
+        let claim_tx = test_liquid_tx(
+            Some(elements::OutPoint::new(lockup_txid, 0)),
+            claim_script.clone(),
+        );
+        let spending_tx = test_liquid_tx(
+            Some(elements::OutPoint::new(lockup_txid, 0)),
+            claim_script,
+        );
+        let spender = spending_tx.txid().to_string();
+        let backend = Arc::new(MockUtxoBackend {
+            raw_txs: HashMap::from([
+                (lockup_txid.to_string(), serialize(&lockup_tx)),
+                (spender.clone(), serialize(&spending_tx)),
+            ]),
+            find_calls: Mutex::new(vec![]),
+            spender: Some(spender.clone()),
+        });
+
+        let backend_dyn: Arc<dyn UtxoBackend> = backend.clone();
+        let got =
+            recover_claim_from_lockup_spend(&BtcLikeTransaction::Liquid(claim_tx), &backend_dyn)
+                .await
+                .unwrap();
+
+        assert_eq!(got, Some(spender));
+        assert_eq!(
+            backend.find_calls.lock().await.as_slice(),
+            &[(lockup_txid.to_string(), 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_claim_from_lockup_spend_returns_none_when_unspent() {
+        let lockup_tx = test_liquid_tx(None, elements::Script::new());
+        let lockup_txid = lockup_tx.txid();
+        let claim_tx = test_liquid_tx(
+            Some(elements::OutPoint::new(lockup_txid, 0)),
+            elements::Script::from(vec![0x51]),
+        );
+        let backend = Arc::new(MockUtxoBackend {
+            raw_txs: HashMap::from([(lockup_txid.to_string(), serialize(&lockup_tx))]),
+            find_calls: Mutex::new(vec![]),
+            spender: None,
+        });
+
+        let backend_dyn: Arc<dyn UtxoBackend> = backend.clone();
+        let got =
+            recover_claim_from_lockup_spend(&BtcLikeTransaction::Liquid(claim_tx), &backend_dyn)
+                .await
+                .unwrap();
+
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn recover_claim_from_lockup_spend_rejects_non_claim_destination() {
+        let lockup_tx = test_liquid_tx(None, elements::Script::new());
+        let lockup_txid = lockup_tx.txid();
+        let claim_tx = test_liquid_tx(
+            Some(elements::OutPoint::new(lockup_txid, 0)),
+            elements::Script::from(vec![0x51]),
+        );
+        let spending_tx = test_liquid_tx(
+            Some(elements::OutPoint::new(lockup_txid, 0)),
+            elements::Script::from(vec![0x52]),
+        );
+        let spender = spending_tx.txid().to_string();
+        let backend = Arc::new(MockUtxoBackend {
+            raw_txs: HashMap::from([
+                (lockup_txid.to_string(), serialize(&lockup_tx)),
+                (spender, serialize(&spending_tx)),
+            ]),
+            find_calls: Mutex::new(vec![]),
+            spender: Some(spending_tx.txid().to_string()),
+        });
+
+        let backend_dyn: Arc<dyn UtxoBackend> = backend.clone();
+        let got =
+            recover_claim_from_lockup_spend(&BtcLikeTransaction::Liquid(claim_tx), &backend_dyn)
+                .await;
+
+        assert!(matches!(got, Err(AppError::ClaimError(_))));
     }
 }
 

@@ -189,13 +189,12 @@ pub(crate) fn decide_action(swap: &ReconcilerSwap, boltz_status: &str) -> Reconc
         // window; the user paid LN and got nothing back.
         ("transaction.refunded", _) => MarkLockupRefunded,
 
-        // Boltz says invoice settled. That should mean WE claimed
-        // (only path that reveals the preimage); if our row isn't
-        // Claimed, something is out of sync.
+        // Boltz says invoice settled. That means the claim API received
+        // our preimage, but Boltz does not track whether our claim tx was
+        // broadcast. If our row is not Claimed yet, nudge the claimer; it
+        // owns the advisory lock and the lockup-outspend recovery probe.
         ("invoice.settled", "claimed") => Noop,
-        ("invoice.settled", _) => NeedsManualAttention(
-            "boltz reports invoice.settled but our status != claimed; PR #8 will electrum-probe",
-        ),
+        ("invoice.settled", _) => ScheduleImmediateClaim,
 
         // `minerfee.paid` and any future Boltz-side states are
         // informational; debug-log and move on.
@@ -434,11 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn boltz_invoice_settled_when_we_did_not_claim_needs_attention() {
-        let swap = fixture("claiming");
-        match decide_action(&swap, "invoice.settled") {
-            ReconcilerAction::NeedsManualAttention(_) => {}
-            other => panic!("expected NeedsManualAttention, got {other:?}"),
+    fn boltz_invoice_settled_when_we_did_not_claim_schedules_retry() {
+        for our in &["claiming", "claim_failed", "lockup_confirmed", "pending"] {
+            let swap = fixture(our);
+            assert_eq!(
+                decide_action(&swap, "invoice.settled"),
+                ReconcilerAction::ScheduleImmediateClaim,
+                "status {our} should schedule claimer recovery"
+            );
         }
     }
 
