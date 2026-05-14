@@ -1,9 +1,10 @@
 # nginx snippet for /etc/nginx/sites-enabled/bullpay
 #
 # Adds direct-from-disk serving for donation-page images at /img/<nym>/<file>.
-# pay-service handles the upload pipeline and writes resized WebP files to
-# /opt/payservice/data/images/<nym>/{avatar,og}.webp; nginx serves them
-# without proxying through Rust.
+# pay-service handles the upload pipeline and writes normalized images to
+# /opt/payservice/data/images/<nym>/avatar.webp and
+# /opt/payservice/data/images/<nym>/og.jpg; nginx serves them without
+# proxying through Rust.
 #
 # Place the `location ^~ /img/` block BEFORE any catch-all `proxy_pass`.
 # `^~` priority ensures /img/* is matched before regex location blocks.
@@ -20,16 +21,24 @@ server {
     # Static donation-page images. nginx serves these directly from disk.
     location ^~ /img/ {
         alias /opt/payservice/data/images/;
-        try_files $uri =404;
+        types {
+            image/webp webp;
+            image/jpeg jpg jpeg;
+        }
+        default_type application/octet-stream;
 
-        # 1-week cache. Image filenames don't include a content hash, so
-        # use Cache-Control with revalidation to keep updates visible.
-        add_header Cache-Control "public, max-age=86400, must-revalidate";
+        add_header Cache-Control "public, max-age=31536000, immutable";
         add_header X-Content-Type-Options nosniff always;
+        try_files $uri @image_not_found;
 
         # Reject any attempt to reach Rust handlers via /img/*.
+        limit_except GET HEAD { deny all; }
         access_log off;
         log_not_found off;
+    }
+
+    location @image_not_found {
+        return 404;
     }
 
     # Rate-limit the donation HTML fallback (GET /<nym>).

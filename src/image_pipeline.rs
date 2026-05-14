@@ -13,8 +13,8 @@
 //!    — rejects image-bombs without allocating the full pixel buffer.
 //! 4. Full decode (now safe; dimensions are bounded).
 //! 5. Resize to target box (avatar 256×256, OG 1200×630).
-//! 6. Lossless WebP encode.
-//! 7. Atomic write: `<root>/<nym>/<kind>.webp.tmp` → fsync → rename.
+//! 6. Encode avatar as WebP and OG as JPEG.
+//! 7. Atomic write: `<root>/<nym>/<kind>.<ext>.tmp` → fsync → rename.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -90,8 +90,8 @@ fn sniff_format(bytes: &[u8]) -> Option<SniffedFormat> {
 
 #[derive(Debug)]
 pub struct ProcessedImage {
-    /// Lossless WebP-encoded bytes ready for atomic write.
-    pub webp_bytes: Vec<u8>,
+    /// Encoded bytes ready for atomic write.
+    pub bytes: Vec<u8>,
     /// SHA-256 of the ORIGINAL upload bytes (for sig verification +
     /// `donation_pages.<kind>_sha256` column).
     pub source_sha256: String,
@@ -105,7 +105,7 @@ pub struct PipelineConfig {
     pub og_height: u32,
 }
 
-/// Run the full decode/resize/re-encode pipeline. Returns the WebP-encoded
+/// Run the full decode/resize/re-encode pipeline. Returns encoded
 /// output bytes and the SHA-256 of the original input.
 ///
 /// Errors:
@@ -170,19 +170,26 @@ pub fn process(
         ImageKind::Og => img.resize_to_fill(cfg.og_width, cfg.og_height, FilterType::Lanczos3),
     };
 
-    // Encode to lossless WebP. The lossy WebP encoder requires libwebp
-    // (system dep); lossless gives us larger output but no FFI deps,
-    // which is the right trade for a 2 MiB upload cap.
+    // Encode avatar as WebP for page display. Encode OG as JPEG because
+    // social-media crawlers handle JPEG more consistently than WebP.
     let mut out = Vec::with_capacity(64 * 1024);
-    {
-        let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
-        resized
-            .write_with_encoder(encoder)
-            .map_err(|e| AppError::ImageInvalid(format!("webp encode failed: {e}")))?;
+    match kind {
+        ImageKind::Avatar => {
+            let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
+            resized
+                .write_with_encoder(encoder)
+                .map_err(|e| AppError::ImageInvalid(format!("webp encode failed: {e}")))?;
+        }
+        ImageKind::Og => {
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+            encoder
+                .encode_image(&resized.to_rgb8())
+                .map_err(|e| AppError::ImageInvalid(format!("jpeg encode failed: {e}")))?;
+        }
     }
 
     Ok(ProcessedImage {
-        webp_bytes: out,
+        bytes: out,
         source_sha256,
     })
 }
@@ -191,9 +198,13 @@ pub fn process(
 /// `kind` are caller-validated (NYM_REGEX upstream + `ImageKind` enum)
 /// so neither can introduce path-traversal characters.
 pub fn image_path(root: &str, nym: &str, kind: ImageKind) -> PathBuf {
+    let ext = match kind {
+        ImageKind::Avatar => "webp",
+        ImageKind::Og => "jpg",
+    };
     Path::new(root)
         .join(nym)
-        .join(format!("{}.webp", kind.as_str()))
+        .join(format!("{}.{}", kind.as_str(), ext))
 }
 
 /// Atomic write: write to `<final>.tmp.<uuid>`, fsync, rename to `<final>`.
@@ -211,7 +222,7 @@ pub fn atomic_write(final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp_suffix = format!("webp.tmp.{}", uuid::Uuid::new_v4());
+    let tmp_suffix = format!("img.tmp.{}", uuid::Uuid::new_v4());
     let tmp_path = final_path.with_extension(tmp_suffix);
     {
         let mut f = fs::File::create(&tmp_path)?;
@@ -311,7 +322,7 @@ mod tests {
         let png = make_test_png(800, 600);
         let result = process(&png, ImageKind::Avatar, &default_cfg()).unwrap();
         // Round-trip the encoded WebP to confirm dimensions.
-        let img = image::load_from_memory(&result.webp_bytes).unwrap();
+        let img = image::load_from_memory(&result.bytes).unwrap();
         assert_eq!(img.width(), 256);
         assert_eq!(img.height(), 256);
         // SHA-256 should match a fresh hash of the input.
@@ -324,7 +335,11 @@ mod tests {
     fn process_resizes_og_to_1200x630() {
         let png = make_test_png(2400, 1260);
         let result = process(&png, ImageKind::Og, &default_cfg()).unwrap();
-        let img = image::load_from_memory(&result.webp_bytes).unwrap();
+        let img = image::load_from_memory(&result.bytes).unwrap();
+        assert_eq!(
+            image::guess_format(&result.bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
         assert_eq!(img.width(), 1200);
         assert_eq!(img.height(), 630);
     }

@@ -499,7 +499,7 @@ pub async fn upload_image(
     let path = image_pipeline::image_path(&state.config.donation.image_root_path, &nym, kind);
     let processed = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         let p = image_pipeline::process(&file_bytes, kind, &pipeline_cfg)?;
-        image_pipeline::atomic_write(&path, &p.webp_bytes).map_err(|e| {
+        image_pipeline::atomic_write(&path, &p.bytes).map_err(|e| {
             tracing::error!(event = "image_atomic_write_failed", error = %e);
             AppError::ImageInvalid("could not persist image".into())
         })?;
@@ -508,7 +508,7 @@ pub async fn upload_image(
     .await
     .map_err(|e| AppError::ImageInvalid(format!("image task join: {e}")))??;
 
-    // Update the row with the new sha256. Output WebP differs from input
+    // Update the row with the new sha256. Output bytes differ from input
     // bytes (we re-encoded), so persist the SOURCE sha — that's what the
     // signature committed to and what the donation_render template uses
     // as a cache-buster query param.

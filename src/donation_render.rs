@@ -154,7 +154,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
     let og_url = page
         .og_sha256
         .as_ref()
-        .map(|_| format!("https://{domain}/img/{}/og.webp", page.nym));
+        .map(|hash| format!("https://{domain}/img/{}/og.jpg?v={hash}", page.nym));
 
     // Fetch the fiat rate. None ⇒ embed minor_per_btc=0 and the JS hides
     // fiat conversion + disables the Donate button. The page still
@@ -286,5 +286,39 @@ mod tests {
     fn slug_rejects_underscores_and_special() {
         assert!(!is_valid_slug("a_b"));
         assert!(!is_valid_slug("a@b"));
+    }
+
+    #[test]
+    fn live_template_renders_social_preview_metadata() {
+        let og_url = "https://bullpay.ca/img/alice/og.jpg?v=abcd";
+        let tpl = DonationPageTpl {
+            nym: "alice",
+            header: "Alice Store",
+            description: "Fresh coffee",
+            public_url: "https://bullpay.ca/alice".to_string(),
+            avatar_url: None,
+            og_url: Some(og_url.to_string()),
+            display_currency: "CAD",
+            website: None,
+            twitter: None,
+            instagram: None,
+            minor_per_btc: 1_000_000_000,
+            last_known_rate: false,
+            supported_currencies: vec![CurrencyView {
+                code: "CAD".to_string(),
+                precision: 2,
+            }],
+        };
+
+        let html = tpl.render().expect("template renders");
+
+        assert!(html.contains(&format!(r#"<meta property="og:image" content="{og_url}">"#)));
+        assert!(html.contains(r#"<meta property="og:image:width" content="1200">"#));
+        assert!(html.contains(r#"<meta property="og:image:height" content="630">"#));
+        assert!(html.contains(r#"<meta property="og:image:type" content="image/jpeg">"#));
+        assert!(html.contains(r#"<meta property="og:image:alt" content="Alice Store">"#));
+        assert!(html.contains(&format!(
+            r#"<meta name="twitter:image" content="{og_url}">"#
+        )));
     }
 }
