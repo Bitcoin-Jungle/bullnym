@@ -62,7 +62,7 @@ impl ChainWatcherConfig {
 }
 
 /// Run the chain watcher loop. Spawned for the lifetime of the server.
-/// Two cadences (P4):
+/// Two cadences:
 ///   - `active_tick_secs`: scans only users with a recent callback.
 ///     Bounded by real traffic, not by the size of the `users` table.
 ///   - `idle_tick_secs`: scans every active user (active + idle). Catches
@@ -139,12 +139,9 @@ pub async fn run(
     }
 }
 
-/// Address-keyed scan for invoices' Liquid destinations. Single SQL
-/// query catches both linked and unlinked invoices; both descriptor-
-/// allocated (legacy) and wallet-supplied (new) addresses; running
-/// alongside the per-nym lookahead in `poll_nyms`. Payment events are
-/// idempotent by outpoint, so the redundant catch in the legacy
-/// descriptor case is harmless.
+/// Address-keyed scan for invoice Liquid destinations. This catches both
+/// linked and unlinked invoices and runs alongside the per-nym lookahead in
+/// `poll_nyms`. Payment events are idempotent by outpoint.
 ///
 /// Direct Liquid accounting: inspect raw tx outputs, unblind outputs that
 /// match the invoice script, and record exact LBTC amounts idempotently.
@@ -440,7 +437,7 @@ async fn poll_nyms(
                 }
             };
 
-            // Use the watcher-dedicated Electrum bucket (P4) so a user-
+            // Use the watcher-dedicated Electrum bucket so a user-
             // callback storm cannot starve the watcher. If our bucket
             // exhausts, drop the rest of this nym's lookahead and try
             // again on the next tick.

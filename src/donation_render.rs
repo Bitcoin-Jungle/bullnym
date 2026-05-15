@@ -1,4 +1,4 @@
-//! Public HTML rendering for `GET /<nym>` (Phase 2).
+//! Public HTML rendering for `GET /<nym>`.
 //!
 //! Wired as `Router::fallback(...)` so all explicit routes (`/health`,
 //! `/register`, `/.well-known/...`) take precedence. Single-segment paths
@@ -94,7 +94,7 @@ fn apply_security_headers(resp: &mut Response) {
     //   so injection through them is blocked.
     // - connect-src widened to wss://liquid.network so the donation page
     //   can subscribe directly to the public Esplora WebSocket for
-    //   instant 0-conf Liquid payment notification (Phase 4 UX). The
+    //   instant zero-conf Liquid payment notification. The
     //   Lightning path remains same-origin (server-side polling).
     h.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -145,8 +145,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
     let domain = &state.config.domain;
     let public_url = format!("https://{domain}/{}", page.nym);
 
-    // Image URLs only render if the corresponding hash is set (Phase 3
-    // populates them on upload; v1 may not have either yet).
+    // Image URLs only render after the upload pipeline stores a hash.
     let avatar_url = page
         .avatar_sha256
         .as_ref()

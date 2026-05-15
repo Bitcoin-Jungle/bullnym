@@ -206,8 +206,7 @@ async fn dispatch_webhook(
 
         // Unknown swap_id is not an error condition for Boltz to retry —
         // either we never created the swap here, or the row was purged.
-        // Returning 200 stops the (5×60s) retry storm. PR #4 hardens
-        // every other branch with the same posture.
+        // Returning 200 stops the Boltz retry storm.
         tracing::warn!("boltz webhook for unknown swap: {}", data.id);
         return Ok("ok");
     };
@@ -267,7 +266,7 @@ async fn dispatch_webhook(
             // so the only path is script-path with the preimage.
             //
             // Action: set `cooperative_refused = TRUE` so the next sweep
-            // tick takes the script path (PR #6 implements that branch).
+            // tick takes the script path.
             // Do NOT transition to a terminal state — that would abandon
             // potentially-claimable funds.
             tracing::warn!(
@@ -310,10 +309,8 @@ async fn dispatch_webhook(
             // user paid the LN invoice and is not made whole — this is
             // the fund-loss terminal state. P0 alert.
             //
-            // Currently this status is not in our webhook subscription
-            // filter (boltz.rs around line 65), so it arrives only via
-            // the reconciler in PR #7. The handler is wired here so the
-            // moment PR #10 adds the filter, the path works.
+            // This status should be rare; if it arrives, preserve a loud
+            // terminal signal for operator rescue.
             tracing::error!(
                 event = "swap_lockup_refunded",
                 swap_id = %data.id,
@@ -537,9 +534,9 @@ async fn try_claim_with_retry(
 ///       persist it into `swap_records.address` (with `address_index = NULL`,
 ///       since there is no descriptor index for wallet-supplied addresses).
 ///
-///   (C) **LN-Address legacy**: the swap is for the ongoing LNURL
-///       Lightning Address flow. Bump `users.next_addr_idx` and derive a
-///       fresh CT address from the user's descriptor.
+///   (C) **Lightning Address**: the swap is for the LNURL flow. Bump
+///       `users.next_addr_idx` and derive a fresh CT address from the
+///       user's descriptor.
 ///
 /// Serialized on the `swap_records` row via `SELECT ... FOR UPDATE`, so
 /// concurrent webhook deliveries (e.g. transaction.mempool followed by
@@ -611,15 +608,11 @@ async fn resolve_claim_address(
         return Ok(addr);
     }
 
-    // (C) LN-Address legacy — descriptor allocator. The `is_active = TRUE`
-    //     filter from the original implementation is intentionally dropped
-    //     here. Funds locked up against a swap we created belong to the
-    //     receiver regardless of their current activation status — a user
-    //     who deactivated between swap creation and HTLC funding still gets
-    //     their claim. `purge_user` already refuses to run while in-flight
-    //     swaps exist (see db.rs:359), and it sets `ct_descriptor = ''`
-    //     which would surface as a derive failure here, so a purged-row
-    //     corner case fails loudly rather than silently strands.
+    // (C) Lightning Address descriptor allocator. Funds locked up against
+    //     a swap we created belong to the receiver even if they deactivate
+    //     the nym before funding. `purge_user` refuses to run while swaps
+    //     are in flight; if a purged row ever reaches this path, the empty
+    //     descriptor fails loudly instead of silently stranding funds.
     let nym = swap.nym.as_deref().ok_or_else(|| {
         AppError::ClaimError(format!(
             "swap {} has no nym and no invoice claim destination",
@@ -788,7 +781,7 @@ async fn claim_swap_inner(
     utxo_backend: Option<&Arc<dyn UtxoBackend>>,
     tolerances: db::InvoiceAccountingTolerances,
 ) -> Result<ClaimOutcome, AppError> {
-    // ----- Phase 1: acquire single-flight, prepare the claim tx.
+    // Acquire single-flight and prepare the claim tx.
     let mut tx = pool
         .begin()
         .await
@@ -824,7 +817,6 @@ async fn claim_swap_inner(
     // resolve_claim_address opens its own short-lived tx with a row-level
     // FOR UPDATE on the swap row. That's fine: we hold an advisory lock
     // (in-memory, no row-level conflict) so its tx goes through cleanly.
-    // PR #4 (state-machine hardening) will inline this into the outer tx.
     let output_address = resolve_claim_address(pool, &swap).await?;
 
     let chain = Chain::Liquid(LiquidChain::Liquid);
@@ -836,7 +828,7 @@ async fn claim_swap_inner(
             .map_err(|e| AppError::ClaimError(format!("decode persisted claim_tx: {e}")))?
     } else {
         // Choose the claim path. `cooperative_refused` is set by either:
-        //   - the webhook handler on `swap.expired` (PR #4), OR
+        //   - the webhook handler on `swap.expired`, OR
         //   - this function on a previous attempt where Boltz returned
         //     a known cooperative-refusal error (below).
         // Once it flips, the row stays on script-path forever — no
@@ -898,7 +890,7 @@ async fn claim_swap_inner(
     };
 
     // Status → Claiming. Forward-only guard prevents regression from
-    // any terminal state. PR #4 generalizes this to a CAS helper.
+    // any terminal state.
     sqlx::query(
         "UPDATE swap_records \
          SET status = 'claiming', updated_at = NOW() \
@@ -914,11 +906,11 @@ async fn claim_swap_inner(
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
 
-    // ----- Phase 2: broadcast outside the lock.
+    // Broadcast outside the lock.
     //
     // Broadcast is pure I/O against Electrum and may take seconds. We
     // hold no DB connection or lock during the call. If the process
-    // dies between here and Phase 3, the next sweep tick re-acquires
+    // dies between here and the final update, the next sweep tick re-acquires
     // the advisory lock, sees `claim_tx_hex` is set, and re-broadcasts
     // THIS exact tx (idempotent).
     let liquid_client =
@@ -949,7 +941,7 @@ async fn claim_swap_inner(
                         broadcast_error = %broadcast_err,
                         "broadcast errored but tx is on chain; treating as success"
                     );
-                    // fall through to Phase 3
+                    // fall through to the final status update
                 }
                 Ok(false) => match recover_claim_from_lockup_spend(&claim_tx, backend).await {
                     Ok(Some(spending_txid)) => {
@@ -1006,7 +998,7 @@ async fn claim_swap_inner(
 
     tracing::info!("swap {} claimed: txid={}", swap.boltz_swap_id, txid);
 
-    // ----- Phase 3: mark Claimed + clear retry bookkeeping.
+    // Mark Claimed and clear retry bookkeeping.
     db::update_swap_status(pool, swap.id, SwapStatus::Claimed, Some(&txid))
         .await
         .map_err(|e| AppError::DbError(e.to_string()))?;
@@ -1348,9 +1340,8 @@ async fn construct_claim_tx(
     let swap_script = SwapScript::reverse_from_swap_resp(chain, &boltz_response, claim_public_key)
         .map_err(|e| AppError::ClaimError(format!("swap script build failed: {e}")))?;
 
-    // New connection per construct call — ElectrumLiquidClient wraps a
-    // TCP socket and isn't Send+Sync, so it can't be shared across tasks.
-    // PR #8 swaps this for the resilient multi-URL utxo::ElectrumClient.
+    // New connection per construct call: ElectrumLiquidClient wraps a TCP
+    // socket and isn't Send+Sync, so it can't be shared across tasks.
     let liquid_client =
         ElectrumLiquidClient::new(LiquidChain::Liquid, electrum_url, true, true, 30)
             .map_err(|e| AppError::ClaimError(format!("electrum connection failed: {e}")))?;

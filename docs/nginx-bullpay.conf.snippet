@@ -52,16 +52,6 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # Rate-limit the donation callback (Phase 4).
-    location /lnurlp/donate-callback/ {
-        limit_req zone=donation_api burst=10 nodelay;
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
     # ... existing catch-all proxy_pass to pay-service for the rest ...
     # location / {
     #     proxy_pass http://127.0.0.1:8080;
@@ -82,7 +72,7 @@ server {
 #        # nginx will return 403 to every donation-page image request.
 #        sudo chmod 755 /opt/payservice/data/images
 #   2. Edit /etc/nginx/sites-enabled/bullpay; integrate the blocks above.
-#      The `^~ /img/` and donation_html / donate-callback blocks are NOT
+#      The `^~ /img/` and donation_html blocks are NOT
 #      drop-in appendables — they must be slotted in BEFORE any catch-all
 #      `location /` (or `proxy_pass` regex) that would shadow them. Run
 #      `nginx -T` first to inspect the existing live config and merge offline.

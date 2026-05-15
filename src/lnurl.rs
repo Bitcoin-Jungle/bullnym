@@ -140,7 +140,7 @@ pub async fn metadata(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Result<Json<LnurlPayMetadata>, AppError> {
-    // P2: gate before any DB work.
+    // Gate before any DB work.
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     gate_metadata_per_ip(&state, peer, &headers, Some(&nym)).await?;
 
@@ -315,14 +315,10 @@ async fn serve_lightning(
 
 /// Reusable Lightning-swap creation. Allocates a swap key, asks Boltz for
 /// a reverse swap, records the swap, returns the LNURL-pay response shape
-/// (with the BOLT11) plus the boltz swap id. Caller decides what to do
-/// with both — `serve_lightning` here just renders JSON; the donation
-/// callback in `donation_callback.rs` includes the swap_id so the page
-/// can poll `/lnurlp/donate-status` for the swap state.
+/// (with the BOLT11) plus the Boltz swap id.
 ///
 /// Rate-limit is the caller's responsibility — different callers gate on
-/// different buckets (LNURL: `lightning_per_source`; donation callback:
-/// `donation_callback_per_source` + `lightning_per_source`).
+/// different buckets.
 pub(crate) async fn create_lightning_swap(
     state: &AppState,
     nym: &str,

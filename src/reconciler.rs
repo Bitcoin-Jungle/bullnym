@@ -141,9 +141,8 @@ pub enum ReconcilerAction {
     MarkLockupRefunded,
     /// Boltz says invoice settled but our row is not Claimed. Either
     /// our broadcast landed but we lost the response, or someone else
-    /// claimed (shouldn't happen but possible). The reconciler can't
-    /// disambiguate without an Electrum probe (PR #8); for now just
-    /// log loudly and let manual-rescue decide.
+    /// claimed. The reconciler logs loudly and leaves manual rescue to
+    /// disambiguate.
     NeedsManualAttention(&'static str),
 }
 
@@ -214,8 +213,8 @@ async fn apply_action(
             );
             db::update_swap_status(pool, swap.id, SwapStatus::LockupMempool, None).await?;
             db::schedule_immediate_claim(pool, swap.id).await?;
-            // Get-paid Step 9: mempool sighting → invoice `in_progress`.
-            // The matching webhook arm in claimer.rs uses the same helper.
+            // Mempool sighting advances the checkout invoice to
+            // `in_progress`. The matching webhook arm uses the same helper.
             invoice::flip_invoice_on_lightning_in_progress(
                 pool,
                 swap.invoice_id,

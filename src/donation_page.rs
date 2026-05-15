@@ -1,4 +1,4 @@
-//! Donation page CRUD endpoints (Phase 1).
+//! Donation page CRUD endpoints.
 //!
 //! - `PUT /donation-page` — save (upsert). One donation page per nym.
 //! - `DELETE /donation-page` — archive (soft-delete; preserves the row so
@@ -244,7 +244,7 @@ pub async fn save(
     // Cheap input validation BEFORE signature verification.
     validate_lengths(&req, &state.pricer)?;
 
-    // Build the v1 payload and verify the Schnorr sig. The exact byte
+    // Build the signed payload and verify the Schnorr sig. The exact byte
     // sequence here MUST match the mobile's signing helper.
     let website = req.website.as_deref().unwrap_or("");
     let twitter = req.twitter.as_deref().unwrap_or("");

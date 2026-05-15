@@ -480,14 +480,8 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
     .execute(&mut *tx)
     .await?;
 
-    // Phase B: cookie-pinned donation_allocations is gone (migration 019).
-    // Invoice rows survive purge with `liquid_address` set, but they
-    // cascade-delete via `users(nym) ON DELETE CASCADE` — except purge
-    // doesn't DELETE the user row, just deactivates it. Invoices remain
-    // queryable by id, but their addresses are no longer derivable
-    // (descriptor wiped below). Acceptable: any in-flight invoice for a
-    // purged user becomes a graveyard row that the GC will eventually
-    // expire to 'expired' status.
+    // Purge deactivates the user rather than deleting it. Existing
+    // invoices remain queryable by id and will expire through GC.
 
     let purged = sqlx::query_as::<_, User>(
         "UPDATE users SET is_active = FALSE, ct_descriptor = '' \
@@ -631,7 +625,7 @@ pub struct SwapRecord {
     /// When this swap is the Lightning offer for an invoice, the claimer
     /// records a payment event against this invoice only after the
     /// merchant-side claim succeeds. NULL for LNURL Lightning Address
-    /// swaps and for legacy donation-page rows.
+    /// swaps and for non-invoice rows.
     pub invoice_id: Option<Uuid>,
     // NOTE: `next_claim_attempt_at` and `last_claim_error_at` are real
     // columns in the schema but intentionally NOT read into this struct.
@@ -697,10 +691,9 @@ pub async fn get_swap_by_id<'e, E: sqlx::PgExecutor<'e>>(
 /// row had already reached a terminal state — the caller should not
 /// treat it as an error.
 ///
-/// NOTE: this guard does not enforce ordinal monotonicity between
-/// non-terminal states (e.g. lockup_confirmed → lockup_mempool, which a
-/// late webhook could provoke). Both are claimable and the consequence
-/// is purely observability noise. PR #4 keeps the simpler invariant.
+/// This guard does not enforce ordinal monotonicity between non-terminal
+/// states. Both lockup mempool and confirmed states are claimable; late
+/// webhook ordering only affects observability.
 pub async fn update_swap_status(
     pool: &PgPool,
     id: Uuid,
@@ -722,7 +715,7 @@ pub async fn update_swap_status(
 }
 
 /// Set `cooperative_refused = TRUE` so the next claim attempt takes the
-/// script path (PR #6 reads this flag in `construct_claim_tx`). Used by
+/// script path. Used by
 /// the webhook handler when Boltz emits `swap.expired` — the cooperative
 /// endpoint refuses post-expiry per `MusigSigner.ts`, but the on-chain
 /// HTLC is still claimable until `timeoutBlockHeight` via the script
@@ -742,8 +735,7 @@ pub async fn mark_cooperative_refused(pool: &PgPool, id: Uuid) -> Result<(), sql
     Ok(())
 }
 
-/// Outcome of `record_claim_failure`. Drives the caller's logging and
-/// (eventually, via PR #11) metrics counters.
+/// Outcome of `record_claim_failure`. Drives the caller's logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimFailureOutcome {
     /// Attempt counter incremented, next_claim_attempt_at set per the
@@ -759,8 +751,7 @@ pub enum ClaimFailureOutcome {
 
 /// Record a failed claim attempt and schedule the next retry.
 ///
-/// Called from `claim_swap` when the broadcast fails (or, in PR #6,
-/// when `construct_claim_tx` exhausts its options). Increments
+/// Called from `claim_swap` when broadcast or construction fails. Increments
 /// `claim_attempts`, stamps `last_claim_error`, and computes
 /// `next_claim_attempt_at` from the documented backoff schedule:
 ///
@@ -986,14 +977,6 @@ pub async fn get_ready_to_claim_swaps(pool: &PgPool) -> Result<Vec<SwapRecord>, 
     .await
 }
 
-/// Backwards-compat alias. Kept because the existing claimer module
-/// imports the old name; subsequent PRs in this rollout will switch
-/// callers over to `get_ready_to_claim_swaps`.
-#[deprecated(note = "use get_ready_to_claim_swaps")]
-pub async fn get_unclaimed_swaps(pool: &PgPool) -> Result<Vec<SwapRecord>, sqlx::Error> {
-    get_ready_to_claim_swaps(pool).await
-}
-
 // --- Outpoint → address index reservations ---
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1132,7 +1115,7 @@ pub async fn try_record_webhook_event(pool: &PgPool, event_id: &str) -> Result<b
     Ok(res.rows_affected() > 0)
 }
 
-// --- Active-user ceiling (P1 max_active_users gate) ---
+// --- Active-user ceiling ---
 
 /// Count rows with `is_active = TRUE` for the registration ceiling check.
 /// Single-shot atomic query; used on the cheap path before signature verify.
@@ -1146,7 +1129,7 @@ pub async fn count_active_users(pool: &PgPool) -> Result<i64, sqlx::Error> {
 // --- Rate limit events ---
 
 // NOTE: the non-atomic write-then-count pair (`record_rate_limit_event` +
-// `count_rate_limit_events`) was removed in P3. All sliding-window axes now
+// `count_rate_limit_events`) was removed. All sliding-window axes now
 // go through either `record_and_count_rate_limit_atomic` (Postgres path
 // with advisory lock) or the in-memory limiter in `rate_limit::InMemorySliding`.
 
@@ -1192,7 +1175,7 @@ pub async fn record_and_count_rate_limit_atomic(
 // Distinct-nym rate-limit helpers
 // =====================================================================
 //
-// NOTE: the non-atomic write-then-count pair was removed in P3. All
+// NOTE: the non-atomic write-then-count pair was removed. All
 // distinct-nyms axes now go through the atomic helper below.
 
 /// Atomic INSERT-then-COUNT-DISTINCT for the distinct-nyms axes,
@@ -1285,7 +1268,7 @@ pub async fn list_recently_active_nyms_for_watcher(
 }
 
 /// Mark that a user was just hit by `/lnurlp/callback`. Drives the
-/// watcher's activity prioritization (P4). Best-effort: an error here is
+/// watcher's activity prioritization. Best-effort: an error here is
 /// logged but not propagated — failing to update activity should never
 /// fail a successful payment-address lookup.
 pub async fn touch_user_callback(pool: &PgPool, nym: &str) {
@@ -1376,7 +1359,7 @@ pub struct UpsertDonationPage<'a> {
     pub enabled: bool,
 }
 
-/// Insert-or-update a donation page row. Mobile sends the full v1 config on
+/// Insert-or-update a donation page row. Mobile sends the full page config on
 /// every save (PUT semantics). Update path clears `archived_at` so a re-save
 /// after archive un-archives — the row is already authenticated by Schnorr
 /// sig at the handler. Image hashes (`avatar_sha256`, `og_sha256`) are NOT
@@ -1478,266 +1461,6 @@ pub async fn update_donation_page_image_hash(
         .await
 }
 
-// =====================================================================
-// Donation-page Liquid allocation (Phase 4)
-// =====================================================================
-
-#[derive(Debug)]
-pub struct DonationAllocation {
-    pub address: String,
-    pub address_index: i32,
-    pub was_existing: bool,
-}
-
-/// Cookie-pinned donation address allocator. Returns the existing binding
-/// if `(nym, source_key, device_id)` already has one within the TTL,
-/// otherwise allocates a fresh address from the user's ct_descriptor at
-/// `users.next_addr_idx` and bumps the index.
-///
-/// `derive_address` is a closure: the caller knows how to derive a CT
-/// address from a descriptor + index, so this fn doesn't depend on the
-/// `descriptor` module directly. Keeps `db.rs` test-friendly and
-/// pure-data.
-///
-/// Concurrency: runs the entire flow inside a tx under
-/// `pg_advisory_xact_lock(hashtext('donation:'||nym))`. Same atomicity
-/// pattern as `register_user_atomic` and the LUD-22 allocator. The lock
-/// keyspace prefix `donation:` is disjoint from `<bare-npub-hex>` and
-/// `<bucket-string>` so no AB/BA deadlock with rate-limit gates.
-pub async fn lookup_or_allocate_donation_address<F>(
-    pool: &PgPool,
-    nym: &str,
-    source_key: &str,
-    device_id: uuid::Uuid,
-    ttl_days: u32,
-    derive_address: F,
-) -> Result<DonationAllocation, sqlx::Error>
-where
-    F: FnOnce(&str, u32) -> Result<String, sqlx::Error>,
-{
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-        .bind(format!("donation:{nym}"))
-        .execute(&mut *tx)
-        .await?;
-
-    // Hit path: existing binding within TTL **and not yet paid**.
-    // Once a donator has paid an address, a fresh Donate click should
-    // generate a NEW address — otherwise the page perpetually shows
-    // the same paid address with the "Paid" status, which is confusing
-    // and prevents subsequent donations.
-    let cached: Option<(String, i32)> = sqlx::query_as(
-        "SELECT address, address_index \
-         FROM donation_allocations \
-         WHERE nym = $1 AND source_key = $2 AND device_id = $3 \
-           AND last_used_at > NOW() - ($4 || ' days')::interval \
-           AND last_paid_at IS NULL",
-    )
-    .bind(nym)
-    .bind(source_key)
-    .bind(device_id)
-    .bind(ttl_days as i32)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some((address, address_index)) = cached {
-        sqlx::query(
-            "UPDATE donation_allocations SET last_used_at = NOW() \
-             WHERE nym = $1 AND source_key = $2 AND device_id = $3",
-        )
-        .bind(nym)
-        .bind(source_key)
-        .bind(device_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        return Ok(DonationAllocation {
-            address,
-            address_index,
-            was_existing: true,
-        });
-    }
-
-    // Miss path: bump users.next_addr_idx atomically, derive address,
-    // insert binding. Bumping (vs static-from-current) ensures each
-    // donator gets a unique address — clean status-feedback semantics.
-    let row: (String, i32) = sqlx::query_as(
-        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
-         WHERE nym = $1 AND is_active = TRUE \
-         RETURNING ct_descriptor, next_addr_idx - 1",
-    )
-    .bind(nym)
-    .fetch_one(&mut *tx)
-    .await?;
-    let (ct_descriptor, address_index) = row;
-    let idx_u32 = u32::try_from(address_index)
-        .map_err(|_| sqlx::Error::Protocol(format!("address index overflow: {address_index}")))?;
-    let address = derive_address(&ct_descriptor, idx_u32)?;
-
-    // ON CONFLICT here means there's an existing row for this
-    // (nym, source_key, device_id) that the cached SELECT skipped —
-    // either because it's been paid (we want to issue a fresh address)
-    // or because it expired (TTL elapsed). Overwrite all fields so
-    // the row reflects the new allocation, including clearing
-    // last_paid_at so status feedback resets cleanly.
-    let inserted: (String, i32) = sqlx::query_as(
-        "INSERT INTO donation_allocations \
-            (nym, source_key, device_id, address_index, address) \
-         VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (nym, source_key, device_id) DO UPDATE \
-            SET address_index = EXCLUDED.address_index, \
-                address = EXCLUDED.address, \
-                allocated_at = NOW(), \
-                last_used_at = NOW(), \
-                last_paid_at = NULL \
-         RETURNING address, address_index",
-    )
-    .bind(nym)
-    .bind(source_key)
-    .bind(device_id)
-    .bind(address_index)
-    .bind(&address)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(DonationAllocation {
-        address: inserted.0,
-        address_index: inserted.1,
-        was_existing: false,
-    })
-}
-
-/// Cheap probe: does `(nym, source_key, device_id)` already have a live
-/// donation binding (within TTL)? Used by `callback_liquid` to skip the
-/// per-source rate-limit gate on cookie HITs — refreshes shouldn't burn
-/// the FRESH-allocation budget. This is advisory only; the source of
-/// truth is the atomic flow in `lookup_or_allocate_donation_address`.
-pub async fn peek_donation_binding(
-    pool: &PgPool,
-    nym: &str,
-    source_key: &str,
-    device_id: uuid::Uuid,
-    ttl_days: u32,
-) -> Result<bool, sqlx::Error> {
-    // Mirror the HIT condition in lookup_or_allocate_donation_address:
-    // a paid binding is treated as a MISS (page should issue a fresh
-    // address on the next Donate click) so the rate-limit gate fires.
-    let row: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM donation_allocations \
-         WHERE nym = $1 AND source_key = $2 AND device_id = $3 \
-           AND last_used_at > NOW() - ($4 || ' days')::interval \
-           AND last_paid_at IS NULL",
-    )
-    .bind(nym)
-    .bind(source_key)
-    .bind(device_id)
-    .bind(ttl_days as i32)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.is_some())
-}
-
-/// Count distinct fresh donation addresses allocated under a source_key
-/// in the last `window_secs`. Used by the per-source rate-limit gate
-/// applied on the MISS path of `lookup_or_allocate_donation_address`.
-pub async fn count_recent_donation_allocations_per_source(
-    pool: &PgPool,
-    source_key: &str,
-    window_secs: u32,
-) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM donation_allocations \
-         WHERE source_key = $1 \
-           AND allocated_at > NOW() - ($2 || ' seconds')::interval",
-    )
-    .bind(source_key)
-    .bind(window_secs as i32)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.0)
-}
-
-/// List unpaid donation_allocations for a nym. Used by the chain
-/// watcher to re-scan donation addresses on each tick — the lookahead
-/// loop alone misses them because the MISS path of
-/// `lookup_or_allocate_donation_address` bumps `next_addr_idx` past the
-/// just-allocated index, leaving the index outside the watcher's
-/// `[next_addr_idx, +lookahead]` scan range.
-pub async fn list_unpaid_donation_allocations(
-    pool: &PgPool,
-    nym: &str,
-) -> Result<Vec<(i32, String)>, sqlx::Error> {
-    sqlx::query_as::<_, (i32, String)>(
-        "SELECT address_index, address \
-         FROM donation_allocations \
-         WHERE nym = $1 AND last_paid_at IS NULL \
-         ORDER BY address_index ASC",
-    )
-    .bind(nym)
-    .fetch_all(pool)
-    .await
-}
-
-/// Mark every still-unpaid donation_allocation that targets `addr_index`
-/// for `nym` as paid. Called by the chain watcher when a payment is
-/// observed at `derive(descriptor, addr_index)`. Each donation_allocation
-/// row has a unique address_index (the MISS path bumps), so this updates
-/// at most one row per call — but we use the same set-based UPDATE shape
-/// as the LUD-22 reservation flow for consistency. Returns rows affected.
-pub async fn mark_donation_paid_at_idx(
-    pool: &PgPool,
-    nym: &str,
-    addr_index: u32,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE donation_allocations \
-            SET last_paid_at = NOW() \
-          WHERE nym = $1 AND address_index = $2 AND last_paid_at IS NULL",
-    )
-    .bind(nym)
-    .bind(addr_index as i32)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-/// Read donation-status payload for a Liquid donation: returns the
-/// allocation's `last_paid_at` (None = not paid yet). Used by the
-/// `/lnurlp/donate-status` poll endpoint.
-pub async fn get_donation_allocation_paid_status(
-    pool: &PgPool,
-    nym: &str,
-    address: &str,
-) -> Result<Option<bool>, sqlx::Error> {
-    // Use COALESCE so the boolean reads back unambiguously: TRUE = paid,
-    // FALSE = waiting, None = address doesn't belong to this nym.
-    let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT (last_paid_at IS NOT NULL) AS paid \
-         FROM donation_allocations \
-         WHERE nym = $1 AND address = $2",
-    )
-    .bind(nym)
-    .bind(address)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(paid,)| paid))
-}
-
-/// Recycler: drop donation_allocations rows older than `ttl_days`. Run
-/// periodically from `gc.rs` so abandoned cookies don't keep allocations
-/// alive forever.
-pub async fn prune_donation_allocations(pool: &PgPool, ttl_days: u32) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM donation_allocations \
-         WHERE last_used_at < NOW() - ($1 || ' days')::interval",
-    )
-    .bind(ttl_days as i32)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
 pub async fn get_donation_page_by_nym(
     pool: &PgPool,
     nym: &str,
@@ -1754,7 +1477,7 @@ pub async fn get_donation_page_by_nym(
 }
 
 // =====================================================================
-// Invoices (Phase B)
+// Invoices
 //
 // Unified payment-intent abstraction. `origin` discriminates two creation
 // flows: 'checkout' (anonymous browser, server-rate-limited per source) and
@@ -2010,9 +1733,8 @@ pub async fn list_invoices_by_npub(
 /// remaining amount and blinding key) gives the chain watcher everything
 /// it needs to unblind candidate txs and record exact payment events.
 ///
-/// Scoped to the legacy descriptor-allocator path
-/// (`liquid_address_index IS NOT NULL`) — wallet-supplied invoices
-/// (`liquid_address_index IS NULL`) are covered by `list_unpaid_invoices_with_liquid_address`.
+/// Scoped to rows with a stored descriptor index. Wallet-supplied addresses
+/// are covered by `list_unpaid_invoices_with_liquid_address`.
 pub async fn list_unpaid_invoice_liquid_addresses(
     pool: &PgPool,
     nym_owner: &str,
@@ -2300,7 +2022,8 @@ fn chrono_like_unix_now() -> i64 {
 
 /// Flip an invoice to `in_progress` on the FIRST mempool sighting of a
 /// payment tx (BTC watcher, or the LN claimer's `transaction.mempool`
-/// hook in Step 9). Idempotent under the `WHERE status = 'unpaid'`
+/// hook used by webhook and reconciler paths). Idempotent under the
+/// `WHERE status = 'unpaid'`
 /// guard: a second sighting tick is a no-op (returns 0). Crucially, a
 /// later `record_invoice_payment` call can still advance an
 /// `in_progress` row to paid/under/over.
@@ -2420,97 +2143,10 @@ pub async fn expire_invoices_past_deadline(pool: &PgPool) -> Result<u64, sqlx::E
     Ok(result.rows_affected())
 }
 
-/// Lazy-allocate the Liquid address for an invoice. Mirrors
-/// `lookup_or_allocate_donation_address`'s atomicity pattern: one
-/// transaction guarded by `pg_advisory_xact_lock(hashtext('donation:'||nym))`
-/// — same lock keyspace as the legacy donation flow so the chain
-/// watcher's existing single-flight assumptions still hold.
-///
-/// Returns:
-/// - `Ok(Some((address, index)))` on first allocation (or on idempotent
-///   re-read if the address was already set).
-/// - `Ok(None)` if the invoice doesn't exist or its nym has no active
-///   user (caller decides the user-facing error).
-///
-/// `derive_address` is a closure: the caller knows how to derive a CT
-/// address from a descriptor + index, so this fn doesn't depend on the
-/// `descriptor` module directly.
-pub async fn allocate_invoice_liquid_address<F>(
-    pool: &PgPool,
-    invoice_id: Uuid,
-    derive_address: F,
-) -> Result<Option<(String, i32)>, sqlx::Error>
-where
-    F: FnOnce(&str, u32) -> Result<String, sqlx::Error>,
-{
-    let mut tx = pool.begin().await?;
-
-    // Need the nym (nym_owner) to scope the advisory lock and bump
-    // next_addr_idx. Unlinked invoices (nym_owner IS NULL) cannot use
-    // this descriptor-allocator path — the caller must wallet-supply
-    // the address at insert time.
-    let nym: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT nym_owner FROM invoices WHERE id = $1 FOR UPDATE")
-            .bind(invoice_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some((Some(nym),)) = nym else {
-        return Ok(None);
-    };
-
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-        .bind(format!("donation:{nym}"))
-        .execute(&mut *tx)
-        .await?;
-
-    // Idempotent re-read: if a concurrent caller already allocated, just
-    // return the existing address.
-    let existing: Option<(Option<String>, Option<i32>)> = sqlx::query_as(
-        "SELECT liquid_address, liquid_address_index \
-         FROM invoices WHERE id = $1",
-    )
-    .bind(invoice_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((Some(addr), Some(idx))) = existing {
-        tx.commit().await?;
-        return Ok(Some((addr, idx)));
-    }
-
-    let row: Option<(String, i32)> = sqlx::query_as(
-        "UPDATE users SET next_addr_idx = next_addr_idx + 1 \
-         WHERE nym = $1 AND is_active = TRUE \
-         RETURNING ct_descriptor, next_addr_idx - 1",
-    )
-    .bind(&nym)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((ct_descriptor, address_index)) = row else {
-        return Ok(None);
-    };
-    let idx_u32 = u32::try_from(address_index)
-        .map_err(|_| sqlx::Error::Protocol(format!("address index overflow: {address_index}")))?;
-    let address = derive_address(&ct_descriptor, idx_u32)?;
-
-    sqlx::query(
-        "UPDATE invoices SET liquid_address = $2, liquid_address_index = $3 \
-         WHERE id = $1",
-    )
-    .bind(invoice_id)
-    .bind(&address)
-    .bind(address_index)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(Some((address, address_index)))
-}
-
-/// Pre-insert sibling of [`allocate_invoice_liquid_address`]: bump
-/// `users.next_addr_idx` for an active nym and derive the next Liquid
-/// address WITHOUT touching any invoice row. Returns `(address, index)`
-/// so the caller can pass `address` into `NewInvoice.liquid_address`
-/// at insert time.
+/// Bump `users.next_addr_idx` for an active nym and derive the next Liquid
+/// address without touching any invoice row. Returns `(address, index)` so
+/// the caller can pass `address` into `NewInvoice.liquid_address` at insert
+/// time.
 ///
 /// Use this when creating an invoice with `accept_ln = TRUE` or
 /// `accept_liquid = TRUE` and no wallet-supplied address — the
@@ -2519,9 +2155,8 @@ where
 /// run before insert. The donation-page checkout flow is the primary
 /// caller.
 ///
-/// Shares the `donation:{nym}` advisory lock with
-/// [`allocate_invoice_liquid_address`] so concurrent allocator calls
-/// for the same nym serialize on the `next_addr_idx` bump.
+/// Uses the `donation:{nym}` advisory lock so concurrent allocator calls for
+/// the same nym serialize on the `next_addr_idx` bump.
 ///
 /// Returns `Ok(None)` when the nym is unknown or `is_active = FALSE`.
 pub async fn allocate_next_liquid_for_active_nym<F>(

@@ -76,6 +76,14 @@ Conceptual session fields:
 - expiry
 - cumulative paid amount
 
+Donation Page checkout no longer uses the legacy
+`/lnurlp/donate-callback/:nym` and `/lnurlp/donate-status/:nym` endpoints.
+The public page creates an invoice session with `POST /<nym>/invoice`, renders
+`/<nym>/i/<invoice_id>`, and polls `/api/v1/invoices/<invoice_id>/status`.
+The old cookie-pinned Liquid allocation table was dropped by migration 019;
+new checkout sessions reserve concrete payment addresses through the invoice
+payment-address ledger.
+
 ## Settlement Destinations
 
 Each payment session must have explicit settlement destinations.

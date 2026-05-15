@@ -120,13 +120,13 @@ pub async fn register(
 ) -> Result<(StatusCode, Json<RegisterResponse>), AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
 
-    // P1: gate before any CPU-expensive work (sig verify, descriptor parse).
+    // Gate before any CPU-expensive work (sig verify, descriptor parse).
     let ip = gate_register_per_ip(&state, peer, &headers).await?;
     let is_whitelisted = ip
         .map(|ip| state.ip_whitelist.contains(ip))
         .unwrap_or(false);
 
-    // P1: hard ceiling on active users. New registrations are blocked once
+    // Hard ceiling on active users. New registrations are blocked once
     // the cap is reached; updates / lookups / deletes still work.
     if !is_whitelisted {
         state.rate_limiter.check_max_active_users().await?;
@@ -145,7 +145,7 @@ pub async fn register(
 
     descriptor::validate_descriptor(&req.ct_descriptor, state.config.limits.max_descriptor_len)?;
 
-    // P1: distinct-npubs-per-IP cap, applied after the cheap input
+    // Distinct-npubs-per-IP cap, applied after the cheap input
     // validation but BEFORE the Schnorr verify. Recording the npub here
     // (without it being verified) is fine because the limiter only counts
     // distinct values — adversarial garbage just consumes the attacker's
@@ -362,8 +362,8 @@ pub async fn lookup_by_npub(
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = gate_register_per_ip(&state, peer, &headers).await?;
 
-    // P2: bound how many distinct npubs one IP can probe. The per-IP
-    // register rate (P1) caps query speed; this caps total enumeration
+    // Bound how many distinct npubs one IP can probe. The per-IP
+    // register rate caps query speed; this caps total enumeration
     // breadth even for a slow attacker.
     if let Some(ip) = ip {
         if !state.ip_whitelist.contains(ip) {

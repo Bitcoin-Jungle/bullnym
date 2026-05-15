@@ -37,11 +37,8 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 dashmap = "6"
 askama = "0.12"
 askama_axum = "0.4"
-tower-cookies = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# Donation-page image pipeline (Phase 3): decode jpg/png/webp, resize,
-# re-encode as lossless WebP. `default-features` is intentional — we
-# rely on jpeg + png + webp decoders being on.
+# Donation-page image pipeline: decode jpg/png/webp, resize, and re-encode.
 image = "0.25"
 # Server-side QR code generation for the donation-page payment view.
 # Default features off — we only need the SVG renderer.

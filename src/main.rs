@@ -297,17 +297,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::delete(donation_page::archive).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/donation-page/:nym", get(donation_page::get))
-        // Phase B step 10 cutover: removed `/lnurlp/donate-callback/:nym`
-        // and `/lnurlp/donate-status/:nym`. The flow is now POST
-        // `/<nym>/invoice` → page navigates to `/<nym>/i/<id>` → polls
-        // `/api/v1/invoices/:id/status`. The `donation_callback` module
-        // and `bullpay_did` cookie are kept in the binary for rollback
-        // safety; they're orphaned (no routes mount them) until Phase D
-        // deletes them.
-        // Phase B — Invoices: anonymous (sender-side) endpoints. Per-route
-        // body cap of 1 KiB on the create endpoint; the global 64 KiB still
-        // applies elsewhere. Status + offer-fetch endpoints are GET/POST
-        // with no body to validate (rate-limit is the gate).
+        // Donation checkout now uses invoice sessions instead of the
+        // removed donation callback/status endpoints.
+        // Anonymous checkout invoice endpoints. The create route keeps a
+        // tight body cap; status and offer routes are rate-limit gated.
         .route(
             "/:nym/invoice",
             post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
@@ -322,8 +315,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/v1/invoices/:id/liquid",
             post(invoice::fetch_liquid_offer),
         )
-        // Get-paid Phase 1 — Schnorr-signed v2 (recipient-side, wallet)
-        // endpoints, linked + unlinked. Body cap 8 KiB on signed POST to
+        // Schnorr-signed recipient invoice endpoints, linked + unlinked.
+        // Body cap 8 KiB on signed POST to
         // bound a misbehaving client; DELETE carries only npub+ts+sig.
         // List uses GET + Query at the npub-keyed root.
         .route(
@@ -363,7 +356,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(donation_render::render_or_404)
         .layer(RequestBodyLimitLayer::new(64 * 1024))
         .merge(image_upload_router)
-        .layer(tower_cookies::CookieManagerLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);

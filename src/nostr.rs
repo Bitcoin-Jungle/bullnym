@@ -27,7 +27,7 @@ pub async fn nostr_json(
     headers: HeaderMap,
     Query(query): Query<Nip05Query>,
 ) -> Result<Json<Nip05Response>, AppError> {
-    // P2: rate-limit the same way as `/.well-known/lnurlp/:nym`. Both
+    // Rate-limit the same way as `/.well-known/lnurlp/:nym`. Both
     // endpoints leak nym-existence the same way; share the bucket so an
     // attacker can't double their budget by alternating endpoints.
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);

@@ -204,8 +204,7 @@ pub async fn flip_invoice_on_bitcoin_boltz_in_progress(
 /// they prove only payer-side progress, not merchant-side settlement.
 ///
 /// Contract:
-/// - `invoice_id == None` → no-op (LNURL Lightning Address swaps and
-///   legacy donation rows have no associated invoice).
+/// - `invoice_id == None` → no-op for non-invoice swaps.
 /// - `record_invoice_payment` is idempotent on
 ///   `lightning_boltz_reverse:<boltz_swap_id>`.
 /// - On error: LOG and RETURN. Never propagate.
@@ -854,7 +853,7 @@ pub async fn status(
         if let Some(ip) = ip {
             state
                 .rate_limiter
-                .check_donation_status_per_source(ip)
+                .check_invoice_status_per_source(ip)
                 .await?;
         }
     }
@@ -1210,14 +1209,8 @@ async fn create_lightning_offer(
         &db::NewSwapRecord {
             nym: swap_nym,
             boltz_swap_id: &result.swap_id,
-            // For wallet-supplied liquid_address invoices, the claim
-            // destination is already known. Pre-populating address here
-            // would require also persisting address_index = NULL plumbed
-            // through `set_swap_address`; leave it None and let Step 10's
-            // `resolve_claim_address` rewrite read invoices.liquid_address
-            // at claim time. The Lightning path stays unchanged for the
-            // legacy descriptor flow (chain_watcher still bumps via
-            // `allocate_invoice_liquid_address`).
+            // Claim destination is resolved from invoices.liquid_address
+            // at claim time and cached into swap_records.address.
             address: None,
             address_index: None,
             amount_sat,
@@ -1317,11 +1310,8 @@ async fn create_bitcoin_chain_offer(
 // =====================================================================
 // POST /api/v1/invoices/:id/liquid — DEPRECATED (returns 410 Gone)
 //
-// Mobile now wallet-supplies the Liquid address at create time; the
-// lazy-allocation endpoint exists only for legacy donation-page checkout
-// flow (which uses `allocate_invoice_liquid_address` indirectly via the
-// chain watcher, not via this HTTP route). Keep the handler so existing
-// route registrations don't 404 — instead surface an actionable error.
+// Wallet-origin invoices supply the Liquid address at create time. Keep the
+// handler so existing route registrations return an actionable 410.
 // =====================================================================
 
 pub async fn fetch_liquid_offer(

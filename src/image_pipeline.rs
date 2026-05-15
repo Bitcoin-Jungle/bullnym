@@ -1,4 +1,4 @@
-//! Donation-page image upload pipeline (Phase 3).
+//! Donation-page image upload pipeline.
 //!
 //! Pipeline order is load-bearing — the cheapest checks run first so that
 //! rejected uploads burn the least server work:

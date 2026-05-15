@@ -6,7 +6,6 @@ pub mod claimer;
 pub mod config;
 pub mod db;
 pub mod descriptor;
-pub mod donation_callback;
 pub mod donation_page;
 pub mod donation_render;
 pub mod error;

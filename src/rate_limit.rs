@@ -28,7 +28,7 @@ pub struct RateLimiter {
     cfg: RateLimitConfig,
     /// User-facing Electrum bucket. Drained by `/lnurlp/callback` only.
     electrum_bucket: Arc<AsyncMutex<TokenBucket>>,
-    /// Dedicated bucket for the chain watcher (P4). Separate so a callback
+    /// Dedicated bucket for the chain watcher. Separate so a callback
     /// storm cannot starve the watcher — and vice-versa.
     watcher_electrum_bucket: Arc<AsyncMutex<TokenBucket>>,
     /// In-memory per-bucket sliding-window counter for the hot per-IP-style
@@ -142,7 +142,7 @@ impl RateLimiter {
         .await
     }
 
-    // --- Registration gates (P1) ---
+    // --- Registration gates ---
 
     /// Cheap-CPU first-line gate on `/register*` and `/register/lookup`.
     /// Applied BEFORE Nostr signature verification so an attacker can't
@@ -197,7 +197,7 @@ impl RateLimiter {
         Ok(())
     }
 
-    // --- Metadata + lookup gates (P2) ---
+    // --- Metadata + lookup gates ---
 
     /// Per-IP rate-limit for `GET /.well-known/lnurlp/:nym` and
     /// `GET /.well-known/nostr.json`. Closes R-enum: enumeration of the
@@ -313,45 +313,9 @@ impl RateLimiter {
         )
     }
 
-    /// Per-source rate-limit on `GET /lnurlp/donate-callback/<nym>`. Loose
-    /// — covers refresh-driven retries.
-    pub async fn check_donation_callback_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
-        let bucket = format!("donation_cb:{}", source_key(ip));
-        self.inmem_sliding_check(
-            &bucket,
-            self.cfg.donation_callback_per_source_per_min,
-            60,
-            AppError::RateLimitedSender,
-        )
-    }
-
-    /// Per-source cap on FRESH Liquid donation-address allocations.
-    /// Counted directly out of `donation_allocations` (the rows are the
-    /// allocations themselves) — no separate event table needed. Only
-    /// the MISS path of `lookup_or_allocate_donation_address` calls this;
-    /// HIT paths never burn budget.
-    pub async fn check_donation_distinct_addrs_per_source(
-        &self,
-        ip: IpAddr,
-    ) -> Result<(), AppError> {
-        let limit = self.cfg.distinct_donation_addresses_per_source_per_hour;
-        if limit == 0 {
-            return Ok(());
-        }
-        let key = source_key(ip);
-        let count = db::count_recent_donation_allocations_per_source(&self.pool, &key, 3600)
-            .await
-            .map_err(AppError::from)?;
-        if count >= limit as i64 {
-            return Err(AppError::RateLimitedNetwork);
-        }
-        Ok(())
-    }
-
-    /// Per-source rate-limit on anonymous `POST /<nym>/invoice` (Phase B).
-    /// Tighter than `donation_callback_per_source_per_min` because each
-    /// success path here creates a real invoice + Boltz reverse-swap;
-    /// page refreshes hit the existing invoice URL and don't re-fire.
+    /// Per-source rate-limit on anonymous `POST /<nym>/invoice`.
+    /// Each success path creates a real invoice + Boltz reverse-swap; page
+    /// refreshes hit the existing invoice URL and don't re-fire.
     pub async fn check_invoice_create_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("invoice_create:{}", source_key(ip));
         self.inmem_sliding_check(
@@ -362,8 +326,8 @@ impl RateLimiter {
         )
     }
 
-    /// Per-npub rate-limit on signed `POST /api/v1/<nym>/invoices`
-    /// (Phase B). Bounds wallet-origin invoice creation per identity, so
+    /// Per-npub rate-limit on signed `POST /api/v1/<nym>/invoices`.
+    /// Bounds wallet-origin invoice creation per identity, so
     /// a stolen credential cannot mass-create invoices even within the
     /// per-IP gate. Bucket key includes the lowercased npub; same
     /// keyspace prefix discipline as the metadata gates so AB/BA
@@ -378,13 +342,12 @@ impl RateLimiter {
         )
     }
 
-    /// Per-source rate-limit on the donation-status poll endpoint. Page
-    /// polls every ~3s; 60/min covers a normal session.
-    pub async fn check_donation_status_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
-        let bucket = format!("donation_status:{}", source_key(ip));
+    /// Per-source rate-limit on public invoice status polling.
+    pub async fn check_invoice_status_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("invoice_status:{}", source_key(ip));
         self.inmem_sliding_check(
             &bucket,
-            self.cfg.donation_status_per_source_per_min,
+            self.cfg.invoice_status_per_source_per_min,
             60,
             AppError::RateLimitedSender,
         )
@@ -438,7 +401,7 @@ impl RateLimiter {
         }
     }
 
-    /// Dedicated Electrum bucket for the chain watcher (P4). Separate
+    /// Dedicated Electrum bucket for the chain watcher. Separate
     /// budget from `check_electrum` so a user-callback storm cannot
     /// starve the watcher and vice-versa. Returns `Err(RateLimited)` when
     /// the bucket is exhausted; the watcher uses this as a signal to

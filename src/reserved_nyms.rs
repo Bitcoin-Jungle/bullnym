@@ -29,11 +29,7 @@ pub const RESERVED_NYMS: &[&str] = &[
     "account",
     "dashboard",
     "test",
-    // Phase B: blocks shadowing the /<nym>/i/<invoice_id> route. The single
-    // segment `/i` falls to the store-page fallback; reserving `i` prevents
-    // a registered nym from colliding with the explicit 3-segment route. The
-    // longer aliases protect against a future rename without re-broadcasting
-    // a reservation list update.
+    // Blocks shadowing invoice render routes such as /<nym>/i/<invoice_id>.
     "i",
     "invoice",
     "invoices",
