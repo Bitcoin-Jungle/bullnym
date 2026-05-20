@@ -48,6 +48,8 @@ Two ARS manifest-evaluation reports were also present, but they do not contain s
   - [ITEM-008 Signed Invoice CRUD/Auth Certification](items/ITEM-008-signed-invoice-crud-auth-certification.md)
   - [ITEM-009 Anonymous Invoice Control-Plane](items/ITEM-009-anonymous-invoice-control-plane.md)
   - [ITEM-010 Invoice State-Machine Edges](items/ITEM-010-invoice-state-machine-edges.md)
+  - [ITEM-011 Public Rendering Safety](items/ITEM-011-public-rendering-safety.md)
+  - [ITEM-012 Rate-Limit And Certification Diagnostics](items/ITEM-012-rate-limit-and-certification-diagnostics.md)
 
 ## Method
 

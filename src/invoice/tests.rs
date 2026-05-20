@@ -313,6 +313,41 @@ fn template_liquid_uri_pins_lbtc_asset() {
 }
 
 #[test]
+fn invoice_template_escapes_user_text_and_js_literals() {
+    let attack = r#"</script><img src=x onerror=alert(1)>&"#;
+    let tpl = InvoicePaymentTpl {
+        nym: "alice",
+        is_unlinked: false,
+        invoice_id: Uuid::nil().to_string(),
+        domain: "bullpay.ca",
+        status: "unpaid",
+        settlement_status: "none",
+        amount_sat: 10_000,
+        remaining_amount_sat: 10_000,
+        fiat_display: None,
+        public_description: Some(attack),
+        recipient_name: Some(attack),
+        invoice_number: Some(attack),
+        accept_btc: true,
+        accept_ln: false,
+        accept_liquid: false,
+        bitcoin_chain_address: None,
+        bitcoin_address_js: js_string_literal(Some(attack)).unwrap(),
+        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+        liquid_address_js: js_string_literal(None).unwrap(),
+        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
+    };
+
+    let html = tpl.render().expect("template renders");
+    assert!(!html.contains("</script><img"));
+    assert!(!html.contains("<img src=x"));
+    assert!(html.contains("&lt;/script&gt;"));
+    assert!(html.contains("\\u003c/script\\u003e"));
+    assert!(html.contains("\\u0026"));
+}
+
+#[test]
 fn api_tolerance_uses_configured_values() {
     let mut inv = invoice_fixture();
     inv.accept_btc = false;
