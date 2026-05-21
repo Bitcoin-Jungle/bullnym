@@ -187,7 +187,23 @@ fn sign_register_with_keypair(
     nym: &str,
     ct_descriptor: &str,
 ) -> (String, u64) {
-    sign_la_action(keypair, "register", npub, nym, &[ct_descriptor])
+    sign_register_with_verification_keypair(keypair, npub, nym, ct_descriptor, npub)
+}
+
+fn sign_register_with_verification_keypair(
+    keypair: &Keypair,
+    npub: &str,
+    nym: &str,
+    ct_descriptor: &str,
+    verification_npub: &str,
+) -> (String, u64) {
+    sign_la_action(
+        keypair,
+        "register",
+        npub,
+        nym,
+        &[ct_descriptor, verification_npub],
+    )
 }
 
 fn sign_delete_with_keypair(keypair: &Keypair, npub: &str, nym: &str) -> (String, u64) {
@@ -396,6 +412,7 @@ async fn register_and_resolve() {
             "nym": "alice",
             "ct_descriptor": TEST_DESCRIPTOR,
             "npub": npub,
+            "verification_npub": npub,
             "signature": sig,
             "timestamp": timestamp,
         }),
@@ -422,6 +439,84 @@ async fn register_and_resolve() {
 }
 
 #[tokio::test]
+async fn legacy_register_without_verification_npub_still_resolves() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let secp = Secp256k1::new();
+    let keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (xonly, _) = keypair.x_only_public_key();
+    let npub = xonly.to_string();
+    let (sig, timestamp) =
+        sign_la_action(&keypair, "register", &npub, "legacyreg", &[TEST_DESCRIPTOR]);
+
+    let (status, _) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "legacyreg",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": npub,
+            "signature": sig,
+            "timestamp": timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = get_path(&app, "/.well-known/nostr.json?name=legacyreg").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["names"]["legacyreg"], npub);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
+async fn register_nip05_resolves_verification_npub() {
+    let pool = test_pool().await;
+    cleanup_db(&pool).await;
+    let app = test_app(test_state(pool.clone()));
+
+    let secp = Secp256k1::new();
+    let auth_keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (auth_xonly, _) = auth_keypair.x_only_public_key();
+    let auth_npub = auth_xonly.to_string();
+    let verification_keypair = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
+    let (verification_xonly, _) = verification_keypair.x_only_public_key();
+    let verification_npub = verification_xonly.to_string();
+    let (sig, timestamp) = sign_register_with_verification_keypair(
+        &auth_keypair,
+        &auth_npub,
+        "verifykey",
+        TEST_DESCRIPTOR,
+        &verification_npub,
+    );
+
+    let (status, _) = post_json(
+        &app,
+        "/register",
+        json!({
+            "nym": "verifykey",
+            "ct_descriptor": TEST_DESCRIPTOR,
+            "npub": auth_npub,
+            "verification_npub": verification_npub,
+            "signature": sig,
+            "timestamp": timestamp,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = get_path(&app, "/.well-known/nostr.json?name=verifykey").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["names"]["verifykey"], verification_npub);
+    assert_ne!(body["names"]["verifykey"], auth_npub);
+
+    cleanup_db(&pool).await;
+}
+
+#[tokio::test]
 async fn register_duplicate_nym_rejected() {
     let pool = test_pool().await;
     cleanup_db(&pool).await;
@@ -432,7 +527,7 @@ async fn register_duplicate_nym_rejected() {
         &app,
         "/register",
         json!({
-            "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "signature": sig1, "timestamp": timestamp1,
+            "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "verification_npub": npub1, "signature": sig1, "timestamp": timestamp1,
         }),
     )
     .await;
@@ -442,7 +537,7 @@ async fn register_duplicate_nym_rejected() {
         &app,
         "/register",
         json!({
-            "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2, "timestamp": timestamp2,
+            "nym": "taken", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "verification_npub": npub2, "signature": sig2, "timestamp": timestamp2,
         }),
     )
     .await;
@@ -461,7 +556,7 @@ async fn register_bad_signature_rejected() {
 
     let (npub, _, timestamp) = sign_registration("badsig", TEST_DESCRIPTOR);
     let (status, _) = post_json(&app, "/register", json!({
-        "nym": "badsig", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": "aa".repeat(32), "timestamp": timestamp,
+        "nym": "badsig", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": "aa".repeat(32), "timestamp": timestamp,
     })).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -480,7 +575,7 @@ async fn register_invalid_nym_rejected() {
             &app,
             "/register",
             json!({
-                "nym": bad_nym, "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+                "nym": bad_nym, "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
             }),
         )
         .await;
@@ -794,7 +889,7 @@ async fn callback_rejects_invalid_amounts() {
         &app,
         "/register",
         json!({
-            "nym": "amtuser", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "amtuser", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -832,7 +927,7 @@ async fn delete_registration_deactivates_user() {
         sign_register_with_keypair(&keypair, &npub_hex, "deluser", TEST_DESCRIPTOR);
 
     post_json(&app, "/register", json!({
-        "nym": "deluser", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub_hex, "signature": sig, "timestamp": timestamp,
+        "nym": "deluser", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub_hex, "verification_npub": npub_hex, "signature": sig, "timestamp": timestamp,
     })).await;
 
     // Delete
@@ -877,7 +972,7 @@ async fn reregister_after_delete_succeeds() {
         &app,
         "/register",
         json!({
-            "nym": "lifecycle1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "lifecycle1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -905,7 +1000,7 @@ async fn reregister_after_delete_succeeds() {
     let (new_sig, new_timestamp) =
         sign_register_with_keypair(&keypair, &npub, "lifecycle2", TEST_DESCRIPTOR);
     let (status, body) = post_json(&app, "/register", json!({
-        "nym": "lifecycle2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": new_sig, "timestamp": new_timestamp,
+        "nym": "lifecycle2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": new_sig, "timestamp": new_timestamp,
     })).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["nym"], "lifecycle2");
@@ -935,7 +1030,7 @@ async fn reregister_same_nym_after_delete() {
         &app,
         "/register",
         json!({
-            "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -963,7 +1058,7 @@ async fn reregister_same_nym_after_delete() {
         &app,
         "/register",
         json!({
-            "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig, "timestamp": re_timestamp,
+            "nym": "samename", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": re_sig, "timestamp": re_timestamp,
         }),
     )
     .await;
@@ -987,7 +1082,7 @@ async fn register_while_active_rejected() {
         &app,
         "/register",
         json!({
-            "nym": "active1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "active1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -1000,7 +1095,7 @@ async fn register_while_active_rejected() {
         &app,
         "/register",
         json!({
-            "nym": "active2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig2, "timestamp": timestamp2,
+            "nym": "active2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig2, "timestamp": timestamp2,
         }),
     )
     .await;
@@ -1024,7 +1119,7 @@ async fn deleted_nym_reserved_from_others() {
         &app,
         "/register",
         json!({
-            "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "signature": sig1, "timestamp": timestamp1,
+            "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub1, "verification_npub": npub1, "signature": sig1, "timestamp": timestamp1,
         }),
     )
     .await;
@@ -1050,7 +1145,7 @@ async fn deleted_nym_reserved_from_others() {
         &app,
         "/register",
         json!({
-            "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2, "timestamp": timestamp2,
+            "nym": "reserved", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "verification_npub": npub2, "signature": sig2, "timestamp": timestamp2,
         }),
     )
     .await;
@@ -1171,7 +1266,7 @@ async fn registration_lifecycle_keeps_address_index_monotonic() {
         .unwrap()
         .unwrap();
     let reactivated =
-        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, 5)
+        pay_service::db::register_user_atomic(&pool, &npub, "idxlife", TEST_DESCRIPTOR, &npub, 5)
             .await
             .unwrap();
     match reactivated {
@@ -3089,7 +3184,7 @@ async fn purge_with_no_swaps_scrubs_descriptor_and_keeps_nym_reserved() {
         &app,
         "/register",
         json!({
-            "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -3124,7 +3219,7 @@ async fn purge_with_no_swaps_scrubs_descriptor_and_keeps_nym_reserved() {
         &app,
         "/register",
         json!({
-            "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "signature": sig2, "timestamp": timestamp2,
+            "nym": "purger1", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub2, "verification_npub": npub2, "signature": sig2, "timestamp": timestamp2,
         }),
     )
     .await;
@@ -3145,7 +3240,7 @@ async fn purge_blocked_when_pending_swap_exists() {
         &app,
         "/register",
         json!({
-            "nym": "purger2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "purger2", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -3190,7 +3285,7 @@ async fn purge_drops_only_terminal_swap_history() {
         &app,
         "/register",
         json!({
-            "nym": "purger3", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "purger3", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -3228,7 +3323,7 @@ async fn delete_signature_does_not_authorize_purge() {
         &app,
         "/register",
         json!({
-            "nym": "purger4", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "purger4", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -3272,7 +3367,7 @@ async fn purge_then_owner_reregisters_same_nym() {
         &app,
         "/register",
         json!({
-            "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": sig, "timestamp": timestamp,
+            "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": sig, "timestamp": timestamp,
         }),
     )
     .await;
@@ -3293,7 +3388,7 @@ async fn purge_then_owner_reregisters_same_nym() {
         &app,
         "/register",
         json!({
-            "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "signature": re_sig, "timestamp": re_timestamp,
+            "nym": "purger5", "ct_descriptor": TEST_DESCRIPTOR, "npub": npub, "verification_npub": npub, "signature": re_sig, "timestamp": re_timestamp,
         }),
     )
     .await;
@@ -3353,16 +3448,30 @@ async fn register_concurrent_does_not_exceed_cap() {
     // Burn 2 of 3 lifetime slots (`LimitsConfig::default()` cap = 3) by
     // creating + deactivating filler rows. Goes through the atomic flow
     // sequentially so the partial unique on active-npub isn't violated.
-    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-0", TEST_DESCRIPTOR, 3)
-        .await
-        .unwrap();
+    pay_service::db::register_user_atomic(
+        &pool,
+        &npub_hex,
+        "filler-0",
+        TEST_DESCRIPTOR,
+        &npub_hex,
+        3,
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-0'")
         .execute(&pool)
         .await
         .unwrap();
-    pay_service::db::register_user_atomic(&pool, &npub_hex, "filler-1", TEST_DESCRIPTOR, 3)
-        .await
-        .unwrap();
+    pay_service::db::register_user_atomic(
+        &pool,
+        &npub_hex,
+        "filler-1",
+        TEST_DESCRIPTOR,
+        &npub_hex,
+        3,
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE users SET is_active = FALSE WHERE nym = 'filler-1'")
         .execute(&pool)
         .await
@@ -3384,6 +3493,7 @@ async fn register_concurrent_does_not_exceed_cap() {
             "nym": "conc-a",
             "ct_descriptor": TEST_DESCRIPTOR,
             "npub": npub_hex,
+            "verification_npub": npub_hex,
             "signature": sig_a,
             "timestamp": timestamp_a,
         }),
@@ -3395,6 +3505,7 @@ async fn register_concurrent_does_not_exceed_cap() {
             "nym": "conc-b",
             "ct_descriptor": TEST_DESCRIPTOR,
             "npub": npub_hex,
+            "verification_npub": npub_hex,
             "signature": sig_b,
             "timestamp": timestamp_b,
         }),

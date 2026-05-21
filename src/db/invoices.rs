@@ -255,33 +255,6 @@ pub async fn list_invoices_by_npub(
     .await
 }
 
-/// List unpaid invoices' Liquid addresses for a nym_owner, ordered by
-/// address_index. Returned shape `(invoice_id, address_index, address,
-/// remaining amount and blinding key) gives the chain watcher everything
-/// it needs to unblind candidate txs and record exact payment events.
-///
-/// Scoped to rows with a stored descriptor index. Wallet-supplied addresses
-/// are covered by `list_unpaid_invoices_with_liquid_address`.
-pub async fn list_unpaid_invoice_liquid_addresses(
-    pool: &PgPool,
-    nym_owner: &str,
-) -> Result<Vec<(Uuid, i32, String, i64, String)>, sqlx::Error> {
-    sqlx::query_as::<_, (Uuid, i32, String, i64, String)>(
-        "SELECT id, liquid_address_index, liquid_address, amount_sat, liquid_blinding_key_hex \
-         FROM invoices \
-         WHERE nym_owner = $1 \
-           AND status IN ('unpaid', 'in_progress', 'partially_paid') \
-           AND accept_liquid = TRUE \
-           AND liquid_address IS NOT NULL \
-           AND liquid_blinding_key_hex IS NOT NULL \
-           AND liquid_address_index IS NOT NULL \
-         ORDER BY liquid_address_index ASC",
-    )
-    .bind(nym_owner)
-    .fetch_all(pool)
-    .await
-}
-
 /// Address-keyed scan for the chain watcher: every unpaid/in_progress
 /// invoice with a settable Liquid address, regardless of nym_owner (so
 /// linked + unlinked are covered uniformly) and regardless of how the

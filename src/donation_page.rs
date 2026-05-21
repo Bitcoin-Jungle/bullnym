@@ -23,6 +23,7 @@ use std::sync::LazyLock;
 
 use crate::auth;
 use crate::db;
+use crate::descriptor;
 use crate::error::AppError;
 use crate::image_pipeline::{self, ImageKind, PipelineConfig};
 use crate::ip_whitelist;
@@ -55,6 +56,8 @@ static INSTAGRAM_HANDLE_REGEX: LazyLock<Regex> =
 pub struct SaveDonationPageRequest {
     pub nym: String,
     pub npub: String,
+    #[serde(default)]
+    pub ct_descriptor: Option<String>,
     pub header: String,
     pub description: String,
     pub display_currency: String,
@@ -116,7 +119,11 @@ impl DonationPageView {
 
 // --- Validation helpers ---
 
-fn validate_lengths(req: &SaveDonationPageRequest, pricer: &PricerClient) -> Result<(), AppError> {
+fn validate_lengths(
+    req: &SaveDonationPageRequest,
+    pricer: &PricerClient,
+    max_descriptor_len: usize,
+) -> Result<(), AppError> {
     if req.header.is_empty() || req.header.len() > MAX_HEADER_LEN {
         return Err(AppError::DonationPageInvalid(format!(
             "header must be 1..={MAX_HEADER_LEN} chars"
@@ -137,6 +144,9 @@ fn validate_lengths(req: &SaveDonationPageRequest, pricer: &PricerClient) -> Res
         return Err(AppError::DonationPageInvalid(
             "display_currency is not supported; fetch /api/v1/supported-currencies".to_string(),
         ));
+    }
+    if let Some(ct_descriptor) = req.ct_descriptor.as_deref().filter(|s| !s.is_empty()) {
+        descriptor::validate_descriptor(ct_descriptor, max_descriptor_len)?;
     }
     if let Some(w) = &req.website {
         if w.len() > MAX_SOCIAL_LINK_LEN {
@@ -193,8 +203,9 @@ fn save_payload_fields<'a>(
     twitter: &'a str,
     instagram: &'a str,
     enabled_str: &'a str,
-) -> [&'a str; 7] {
-    [
+    ct_descriptor: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut fields = vec![
         header,
         description,
         display_currency,
@@ -202,7 +213,11 @@ fn save_payload_fields<'a>(
         twitter,
         instagram,
         enabled_str,
-    ]
+    ];
+    if let Some(ct_descriptor) = ct_descriptor {
+        fields.push(ct_descriptor);
+    }
+    fields
 }
 
 /// Confirm the signing npub owns `nym` AND the user row is currently active.
@@ -242,7 +257,7 @@ pub async fn save(
     }
 
     // Cheap input validation BEFORE signature verification.
-    validate_lengths(&req, &state.pricer)?;
+    validate_lengths(&req, &state.pricer, state.config.limits.max_descriptor_len)?;
 
     // Build the signed payload and verify the Schnorr sig. The exact byte
     // sequence here MUST match the mobile's signing helper.
@@ -258,6 +273,7 @@ pub async fn save(
         twitter,
         instagram,
         enabled_str,
+        req.ct_descriptor.as_deref(),
     );
     auth::verify_la_v2(
         ACTION_SAVE,
@@ -275,6 +291,7 @@ pub async fn save(
         &state.db,
         &db::UpsertDonationPage {
             nym: &req.nym,
+            ct_descriptor: req.ct_descriptor.as_deref().filter(|s| !s.is_empty()),
             header: &req.header,
             description: &req.description,
             display_currency: &req.display_currency,

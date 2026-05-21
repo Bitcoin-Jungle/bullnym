@@ -8,6 +8,7 @@ pub struct User {
     pub id: Uuid,
     pub nym: String,
     pub npub: String,
+    pub verification_npub: String,
     pub ct_descriptor: String,
     pub next_addr_idx: i32,
     pub is_active: bool,
@@ -15,7 +16,8 @@ pub struct User {
 
 pub async fn get_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+        "SELECT id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE nym = $1",
     )
     .bind(nym)
@@ -25,7 +27,8 @@ pub async fn get_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, s
 
 pub async fn get_active_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+        "SELECT id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE nym = $1 AND is_active = TRUE",
     )
     .bind(nym)
@@ -35,7 +38,8 @@ pub async fn get_active_user_by_nym(pool: &PgPool, nym: &str) -> Result<Option<U
 
 pub async fn get_user_by_npub(pool: &PgPool, npub: &str) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+        "SELECT id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE npub = $1 AND is_active = TRUE",
     )
     .bind(npub)
@@ -48,7 +52,8 @@ pub async fn get_inactive_user_by_npub(
     npub: &str,
 ) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+        "SELECT id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE npub = $1 AND is_active = FALSE \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -152,6 +157,7 @@ pub async fn register_user_atomic(
     npub: &str,
     nym: &str,
     ct_descriptor: &str,
+    verification_npub: &str,
     cap: i64,
 ) -> Result<RegisterOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -164,7 +170,8 @@ pub async fn register_user_atomic(
     // Re-check inside the lock — another tx may have inserted the active row
     // while we were waiting.
     let active = sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+        "SELECT id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE npub = $1 AND is_active = TRUE",
     )
     .bind(npub)
@@ -176,7 +183,8 @@ pub async fn register_user_atomic(
     }
 
     let prior_inactive = sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+        "SELECT id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE npub = $1 AND is_active = FALSE \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -189,13 +197,15 @@ pub async fn register_user_atomic(
         // invoices/reservations may still hold addresses from this descriptor,
         // and rewinding can collide with the global single-use address index.
         let user = sqlx::query_as::<_, User>(
-            "UPDATE users SET ct_descriptor = $3, is_active = TRUE \
+            "UPDATE users SET ct_descriptor = $3, verification_npub = $4, is_active = TRUE \
              WHERE npub = $1 AND nym = $2 AND is_active = FALSE \
-             RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+             RETURNING id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                       ct_descriptor, next_addr_idx, is_active",
         )
         .bind(npub)
         .bind(&prior.nym)
         .bind(ct_descriptor)
+        .bind(verification_npub)
         .fetch_one(&mut *tx)
         .await?;
         // Descriptor may have changed, so cached outpoint→addr_index mappings
@@ -219,12 +229,14 @@ pub async fn register_user_atomic(
     }
 
     let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (nym, npub, ct_descriptor) VALUES ($1, $2, $3) \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+        "INSERT INTO users (nym, npub, ct_descriptor, verification_npub) VALUES ($1, $2, $3, $4) \
+         RETURNING id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                   ct_descriptor, next_addr_idx, is_active",
     )
     .bind(nym)
     .bind(npub)
     .bind(ct_descriptor)
+    .bind(verification_npub)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -238,8 +250,9 @@ pub async fn create_user(
     ct_descriptor: &str,
 ) -> Result<User, sqlx::Error> {
     sqlx::query_as::<_, User>(
-        "INSERT INTO users (nym, npub, ct_descriptor) VALUES ($1, $2, $3) \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+        "INSERT INTO users (nym, npub, ct_descriptor, verification_npub) VALUES ($1, $2, $3, $2) \
+         RETURNING id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                   ct_descriptor, next_addr_idx, is_active",
     )
     .bind(nym)
     .bind(npub)
@@ -257,7 +270,8 @@ pub async fn update_user_descriptor(
     let user_opt = sqlx::query_as::<_, User>(
         "UPDATE users SET ct_descriptor = $2 \
          WHERE npub = $1 AND is_active = TRUE \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+         RETURNING id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                   ct_descriptor, next_addr_idx, is_active",
     )
     .bind(npub)
     .bind(ct_descriptor)
@@ -277,7 +291,8 @@ pub async fn deactivate_user(pool: &PgPool, npub: &str) -> Result<Option<User>, 
     sqlx::query_as::<_, User>(
         "UPDATE users SET is_active = FALSE \
          WHERE npub = $1 AND is_active = TRUE \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+         RETURNING id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                   ct_descriptor, next_addr_idx, is_active",
     )
     .bind(npub)
     .fetch_optional(pool)
@@ -304,7 +319,8 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
     let mut tx = pool.begin().await?;
 
     let user_opt = sqlx::query_as::<_, User>(
-        "SELECT id, nym, npub, ct_descriptor, next_addr_idx, is_active \
+        "SELECT id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                ct_descriptor, next_addr_idx, is_active \
          FROM users WHERE npub = $1 AND is_active = TRUE FOR UPDATE",
     )
     .bind(npub)
@@ -356,7 +372,8 @@ pub async fn purge_user(pool: &PgPool, npub: &str) -> Result<PurgeOutcome, sqlx:
     let purged = sqlx::query_as::<_, User>(
         "UPDATE users SET is_active = FALSE, ct_descriptor = '' \
          WHERE id = $1 \
-         RETURNING id, nym, npub, ct_descriptor, next_addr_idx, is_active",
+         RETURNING id, nym, npub, COALESCE(verification_npub, npub) AS verification_npub, \
+                   ct_descriptor, next_addr_idx, is_active",
     )
     .bind(user.id)
     .fetch_one(&mut *tx)

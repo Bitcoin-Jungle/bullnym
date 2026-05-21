@@ -38,7 +38,7 @@ pub async fn nostr_json(
         .ok_or_else(|| AppError::NymNotFound(query.name.clone()))?;
 
     let mut names = HashMap::new();
-    names.insert(user.nym, user.npub);
+    names.insert(user.nym, user.verification_npub);
 
     Ok(Json(Nip05Response { names }))
 }

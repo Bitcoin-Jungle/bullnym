@@ -53,11 +53,15 @@ async fn gate_register_per_ip(
 
 static NYM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9\-]{1,30}[a-z0-9]$").unwrap());
+static NOSTR_PUBKEY_HEX_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{64}$").unwrap());
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub nym: String,
     pub ct_descriptor: String,
+    #[serde(default)]
+    pub verification_npub: Option<String>,
     pub npub: String,
     pub signature: String,
     pub timestamp: u64,
@@ -161,6 +165,12 @@ pub async fn register(
     }
 
     descriptor::validate_descriptor(&req.ct_descriptor, state.config.limits.max_descriptor_len)?;
+    let verification_npub = req.verification_npub.as_deref().unwrap_or(&req.npub);
+    if !NOSTR_PUBKEY_HEX_REGEX.is_match(verification_npub) {
+        return Err(AppError::AuthError(
+            "verification_npub must be a 64-character hex public key".to_string(),
+        ));
+    }
 
     // Distinct-npubs-per-IP cap, applied after the cheap input
     // validation but BEFORE the Schnorr verify. Recording the npub here
@@ -176,11 +186,15 @@ pub async fn register(
         }
     }
 
+    let register_fields = match req.verification_npub.as_deref() {
+        Some(_) => vec![req.ct_descriptor.as_str(), verification_npub],
+        None => vec![req.ct_descriptor.as_str()],
+    };
     auth::verify_la_v2(
         "register",
         &req.npub,
         &req.nym,
-        &[&req.ct_descriptor],
+        &register_fields,
         req.timestamp,
         &req.signature,
     )?;
@@ -190,7 +204,16 @@ pub async fn register(
     // re-registering the original nym reactivates the same row so swap
     // history follows the FK; a different nym becomes a fresh row.
     let cap = state.config.limits.max_lifetime_nyms_per_npub;
-    match db::register_user_atomic(&state.db, &req.npub, &req.nym, &req.ct_descriptor, cap).await? {
+    match db::register_user_atomic(
+        &state.db,
+        &req.npub,
+        &req.nym,
+        &req.ct_descriptor,
+        verification_npub,
+        cap,
+    )
+    .await?
+    {
         db::RegisterOutcome::Created(_) | db::RegisterOutcome::Reactivated(_) => {}
         db::RegisterOutcome::KeyAlreadyRegistered { nym } => {
             return Err(AppError::KeyAlreadyRegistered {

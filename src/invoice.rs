@@ -494,15 +494,30 @@ pub async fn create_anonymous(
     // The `invoices_ln_or_liquid_addr_chk` constraint requires
     // `liquid_address` to be present at insert time when either LN or
     // Liquid is accepted, so allocation must run BEFORE insert.
-    let (liquid_address, _liquid_index) =
-        db::allocate_next_liquid_for_active_nym(&state.db, &nym, |ct_descriptor, idx| {
+    let (liquid_address, _liquid_index, payment_descriptor) =
+        match db::allocate_next_liquid_for_donation_page(&state.db, &nym, |ct_descriptor, idx| {
             descriptor::derive_address(ct_descriptor, idx)
                 .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
         })
         .await?
-        .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
+        {
+            Some((address, index, descriptor)) => (address, index, descriptor),
+            None => {
+                let (address, index) = db::allocate_next_liquid_for_active_nym(
+                    &state.db,
+                    &nym,
+                    |ct_descriptor, idx| {
+                        descriptor::derive_address(ct_descriptor, idx)
+                            .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
+                    },
+                )
+                .await?
+                .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
+                (address, index, owner.ct_descriptor.clone())
+            }
+        };
     let liquid_blinding_key_hex =
-        descriptor::derive_blinding_key_hex(&owner.ct_descriptor, &liquid_address)?;
+        descriptor::derive_blinding_key_hex(&payment_descriptor, &liquid_address)?;
 
     let new_invoice = db::NewInvoice {
         nym_owner: Some(&nym),

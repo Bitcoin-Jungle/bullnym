@@ -3,6 +3,8 @@ use sqlx::PgPool;
 #[derive(Debug, sqlx::FromRow)]
 pub struct DonationPage {
     pub nym: String,
+    pub ct_descriptor: Option<String>,
+    pub next_addr_idx: i32,
     pub header: String,
     pub description: String,
     pub avatar_sha256: Option<String>,
@@ -20,6 +22,7 @@ pub struct DonationPage {
 
 pub struct UpsertDonationPage<'a> {
     pub nym: &'a str,
+    pub ct_descriptor: Option<&'a str>,
     pub header: &'a str,
     pub description: &'a str,
     pub display_currency: &'a str,
@@ -39,10 +42,11 @@ pub async fn upsert_donation_page(
 ) -> Result<DonationPage, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "INSERT INTO donation_pages \
-            (nym, header, description, display_currency, \
+            (nym, ct_descriptor, header, description, display_currency, \
              website, twitter, instagram, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (nym) DO UPDATE SET \
+             ct_descriptor = COALESCE(EXCLUDED.ct_descriptor, donation_pages.ct_descriptor), \
              header = EXCLUDED.header, \
              description = EXCLUDED.description, \
              display_currency = EXCLUDED.display_currency, \
@@ -52,11 +56,12 @@ pub async fn upsert_donation_page(
              enabled = EXCLUDED.enabled, \
              archived_at = NULL, \
              updated_at = now() \
-         RETURNING nym, header, description, avatar_sha256, og_sha256, \
+         RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                    display_currency, website, twitter, \
                    instagram, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
     .bind(page.nym)
+    .bind(page.ct_descriptor)
     .bind(page.header)
     .bind(page.description)
     .bind(page.display_currency)
@@ -78,7 +83,7 @@ pub async fn archive_donation_page(
     sqlx::query_as::<_, DonationPage>(
         "UPDATE donation_pages SET archived_at = now(), updated_at = now() \
          WHERE nym = $1 AND archived_at IS NULL \
-         RETURNING nym, header, description, avatar_sha256, og_sha256, \
+         RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                    display_currency, website, twitter, \
                    instagram, enabled, (archived_at IS NOT NULL) AS is_archived",
     )
@@ -102,14 +107,14 @@ pub async fn update_donation_page_image_hash(
         "avatar_sha256" => {
             "UPDATE donation_pages SET avatar_sha256 = $2, updated_at = now() \
              WHERE nym = $1 \
-             RETURNING nym, header, description, avatar_sha256, og_sha256, \
+             RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                        display_currency, website, twitter, \
                        instagram, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
         "og_sha256" => {
             "UPDATE donation_pages SET og_sha256 = $2, updated_at = now() \
              WHERE nym = $1 \
-             RETURNING nym, header, description, avatar_sha256, og_sha256, \
+             RETURNING nym, ct_descriptor, next_addr_idx, header, description, avatar_sha256, og_sha256, \
                        display_currency, website, twitter, \
                        instagram, enabled, (archived_at IS NOT NULL) AS is_archived"
         }
@@ -132,6 +137,7 @@ pub async fn get_donation_page_by_nym(
 ) -> Result<Option<DonationPage>, sqlx::Error> {
     sqlx::query_as::<_, DonationPage>(
         "SELECT nym, header, description, avatar_sha256, og_sha256, \
+                ct_descriptor, next_addr_idx, \
                 display_currency, website, twitter, \
                 instagram, enabled, (archived_at IS NOT NULL) AS is_archived \
          FROM donation_pages WHERE nym = $1",
@@ -139,4 +145,77 @@ pub async fn get_donation_page_by_nym(
     .bind(nym)
     .fetch_optional(pool)
     .await
+}
+
+/// Bump `donation_pages.next_addr_idx` for an enabled, non-archived page and
+/// derive the next Liquid address from the page-specific descriptor.
+pub async fn allocate_next_liquid_for_donation_page<F>(
+    pool: &PgPool,
+    nym: &str,
+    derive_address: F,
+) -> Result<Option<(String, i32, String)>, sqlx::Error>
+where
+    F: Fn(&str, u32) -> Result<String, sqlx::Error>,
+{
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("donation-page:{nym}"))
+        .execute(&mut *tx)
+        .await?;
+
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "SELECT ct_descriptor, next_addr_idx \
+         FROM donation_pages \
+         WHERE nym = $1 \
+           AND enabled = TRUE \
+           AND archived_at IS NULL \
+           AND ct_descriptor IS NOT NULL",
+    )
+    .bind(nym)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some((ct_descriptor, mut address_index)) = row else {
+        return Ok(None);
+    };
+
+    for _ in 0..100 {
+        let idx_u32 = u32::try_from(address_index).map_err(|_| {
+            sqlx::Error::Protocol(format!("address index overflow: {address_index}"))
+        })?;
+        let address = derive_address(&ct_descriptor, idx_u32)?;
+        let in_use: bool = sqlx::query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM invoice_payment_addresses \
+                WHERE rail = 'liquid' AND address = $1 \
+            )",
+        )
+        .bind(&address)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !in_use {
+            sqlx::query("UPDATE donation_pages SET next_addr_idx = $2 WHERE nym = $1")
+                .bind(nym)
+                .bind(address_index + 1)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(Some((address, address_index, ct_descriptor)));
+        }
+
+        address_index += 1;
+    }
+
+    sqlx::query("UPDATE donation_pages SET next_addr_idx = $2 WHERE nym = $1")
+        .bind(nym)
+        .bind(address_index)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Err(sqlx::Error::Protocol(format!(
+        "could not allocate unused Payment Page Liquid address for {nym} after 100 attempts"
+    )))
 }

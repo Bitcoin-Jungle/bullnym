@@ -65,7 +65,6 @@ struct ChainWatcherPollCtx<'a> {
     pool: &'a PgPool,
     backend: &'a (dyn UtxoBackend + Send + Sync),
     rate_limiter: &'a RateLimiter,
-    tolerances: db::InvoiceAccountingTolerances,
     cancel: &'a CancellationToken,
 }
 
@@ -118,7 +117,6 @@ pub async fn run(
                         pool: &pool,
                         backend: backend.as_ref(),
                         rate_limiter: rate_limiter.as_ref(),
-                        tolerances,
                         cancel: &cancel,
                     },
                     cfg.lookahead,
@@ -146,7 +144,6 @@ pub async fn run(
                         pool: &pool,
                         backend: backend.as_ref(),
                         rate_limiter: rate_limiter.as_ref(),
-                        tolerances,
                         cancel: &cancel,
                     },
                     cfg.lookahead,
@@ -367,63 +364,6 @@ async fn poll_nyms(
     for n in nyms {
         if ctx.cancel.is_cancelled() {
             return Ok(());
-        }
-
-        let unpaid_invoices = match db::list_unpaid_invoice_liquid_addresses(ctx.pool, &n.nym).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    "chain_watcher: list unpaid invoice liquid addrs for nym={} failed: {e}",
-                    n.nym
-                );
-                Vec::new()
-            }
-        };
-        for (invoice_id, addr_index, address, _remaining_minor, blinding_key_hex) in
-            &unpaid_invoices
-        {
-            if ctx.cancel.is_cancelled() {
-                return Ok(());
-            }
-            if ctx.rate_limiter.check_electrum_watcher().await.is_err() {
-                break;
-            }
-            let idx = match u32::try_from(*addr_index) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let script = match derive_script_pubkey(&n.ct_descriptor, idx) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        "chain_watcher: invoice derive failed for nym={} idx={}: {e}",
-                        n.nym,
-                        idx
-                    );
-                    continue;
-                }
-            };
-            match record_liquid_events_for_script(
-                ctx.pool,
-                ctx.backend,
-                *invoice_id,
-                address,
-                &script,
-                blinding_key_hex,
-                ctx.tolerances,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "chain_watcher: invoice Liquid output scan failed for nym={} idx={}: {e}",
-                        n.nym,
-                        idx
-                    );
-                }
-            }
         }
 
         // Skip rows with negative or implausible indices defensively — DB

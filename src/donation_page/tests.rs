@@ -1,5 +1,7 @@
 use super::*;
 
+const TEST_DESCRIPTOR: &str = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84h/1776h/0h]xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#y8jljyxl";
+
 #[test]
 fn save_payload_fields_fixed_order() {
     let fields = save_payload_fields(
@@ -10,10 +12,28 @@ fn save_payload_fields_fixed_order() {
         "alice",
         "alice_ig",
         "1",
+        Some(TEST_DESCRIPTOR),
     );
-    assert_eq!(fields.len(), 7);
+    assert_eq!(fields.len(), 8);
     assert_eq!(fields[0], "Alice's Coffee");
     assert_eq!(fields[2], "USD");
+    assert_eq!(fields[6], "1");
+    assert_eq!(fields[7], TEST_DESCRIPTOR);
+}
+
+#[test]
+fn legacy_save_payload_fields_omit_descriptor() {
+    let fields = save_payload_fields(
+        "Alice's Coffee",
+        "Buy me a coffee!",
+        "USD",
+        "https://alice.example",
+        "alice",
+        "alice_ig",
+        "1",
+        None,
+    );
+    assert_eq!(fields.len(), 7);
     assert_eq!(fields[6], "1");
 }
 
@@ -32,6 +52,7 @@ fn v2_save_message_byte_exact_contract() {
         "alice",
         "alice_ig",
         "1",
+        Some(TEST_DESCRIPTOR),
     );
     let npub = "00".repeat(32);
     let timestamp: u64 = 1_700_000_000;
@@ -53,6 +74,41 @@ fn v2_save_message_byte_exact_contract() {
     expected.extend_from_slice(b"1700000000");
 
     assert_eq!(msg, expected, "v2 byte order regression");
+    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 12);
+}
+
+#[test]
+fn legacy_v2_save_message_byte_exact_contract() {
+    let fields = save_payload_fields(
+        "Alice's Coffee",
+        "Buy me a coffee!",
+        "USD",
+        "https://alice.example",
+        "alice",
+        "alice_ig",
+        "1",
+        None,
+    );
+    let npub = "00".repeat(32);
+    let timestamp: u64 = 1_700_000_000;
+    let msg = crate::auth::build_la_v2_message(ACTION_SAVE, &npub, "alice", &fields, timestamp);
+
+    let mut expected: Vec<u8> = Vec::new();
+    expected.extend_from_slice(b"bullpay-la-v2");
+    expected.push(0);
+    expected.extend_from_slice(b"donation-page-save");
+    expected.push(0);
+    expected.extend_from_slice(npub.as_bytes());
+    expected.push(0);
+    expected.extend_from_slice(b"alice");
+    expected.push(0);
+    for f in &fields {
+        expected.extend_from_slice(f.as_bytes());
+        expected.push(0);
+    }
+    expected.extend_from_slice(b"1700000000");
+
+    assert_eq!(msg, expected, "legacy v2 byte order regression");
     assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 11);
 }
 
@@ -111,6 +167,7 @@ fn make_req() -> SaveDonationPageRequest {
     SaveDonationPageRequest {
         nym: "alice".to_string(),
         npub: "00".repeat(32),
+        ct_descriptor: Some(TEST_DESCRIPTOR.to_string()),
         header: "Title".to_string(),
         description: "Desc".to_string(),
         display_currency: "USD".to_string(),
@@ -127,51 +184,62 @@ fn test_pricer() -> PricerClient {
     PricerClient::new(Default::default()).unwrap()
 }
 
+fn validate_req(req: &SaveDonationPageRequest) -> Result<(), AppError> {
+    validate_lengths(req, &test_pricer(), TEST_DESCRIPTOR.len() + 1)
+}
+
 #[test]
 fn validates_minimal_request() {
-    assert!(validate_lengths(&make_req(), &test_pricer()).is_ok());
+    assert!(validate_req(&make_req()).is_ok());
+}
+
+#[test]
+fn validates_legacy_request_without_page_descriptor() {
+    let mut req = make_req();
+    req.ct_descriptor = None;
+    assert!(validate_req(&req).is_ok());
 }
 
 #[test]
 fn rejects_empty_header() {
     let mut req = make_req();
     req.header = String::new();
-    assert!(validate_lengths(&req, &test_pricer()).is_err());
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
 fn rejects_long_header() {
     let mut req = make_req();
     req.header = "a".repeat(MAX_HEADER_LEN + 1);
-    assert!(validate_lengths(&req, &test_pricer()).is_err());
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
 fn rejects_long_description() {
     let mut req = make_req();
     req.description = "a".repeat(MAX_DESCRIPTION_LEN + 1);
-    assert!(validate_lengths(&req, &test_pricer()).is_err());
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
 fn rejects_unknown_currency() {
     let mut req = make_req();
     req.display_currency = "BTC".to_string();
-    assert!(validate_lengths(&req, &test_pricer()).is_err());
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
 fn rejects_non_canonical_currency() {
     let mut req = make_req();
     req.display_currency = "usd".to_string();
-    assert!(validate_lengths(&req, &test_pricer()).is_err());
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
 fn rejects_non_https_website() {
     let mut req = make_req();
     req.website = Some("http://insecure.example".to_string());
-    assert!(validate_lengths(&req, &test_pricer()).is_err());
+    assert!(validate_req(&req).is_err());
 }
 
 #[test]
@@ -180,12 +248,12 @@ fn accepts_empty_optional_fields() {
     req.website = None;
     req.twitter = None;
     req.instagram = None;
-    assert!(validate_lengths(&req, &test_pricer()).is_ok());
+    assert!(validate_req(&req).is_ok());
 }
 
 #[test]
 fn rejects_bad_twitter_handle() {
     let mut req = make_req();
     req.twitter = Some("has space".to_string());
-    assert!(validate_lengths(&req, &test_pricer()).is_err());
+    assert!(validate_req(&req).is_err());
 }
