@@ -340,7 +340,7 @@ pub enum ClaimFailureOutcome {
 ///
 /// ```text
 /// claim_attempts (post-increment): 1, 2, 3,  4,   5,    6,    7+
-/// delay (seconds):                30, 60, 120, 300, 600, 1800, 3600 (cap)
+/// delay (seconds):                10, 20, 60, 300, 600, 1800, 3600 (cap)
 /// ```
 ///
 /// ±20% jitter is applied via Postgres `random()` so a backlog draining
@@ -369,9 +369,9 @@ pub async fn record_claim_failure(
              updated_at = NOW(), \
              next_claim_attempt_at = NOW() + ( \
                  CASE \
-                     WHEN claim_attempts + 1 <= 1 THEN INTERVAL '30 seconds' \
-                     WHEN claim_attempts + 1 = 2 THEN INTERVAL '60 seconds' \
-                     WHEN claim_attempts + 1 = 3 THEN INTERVAL '120 seconds' \
+                     WHEN claim_attempts + 1 <= 1 THEN INTERVAL '10 seconds' \
+                     WHEN claim_attempts + 1 = 2 THEN INTERVAL '20 seconds' \
+                     WHEN claim_attempts + 1 = 3 THEN INTERVAL '60 seconds' \
                      WHEN claim_attempts + 1 = 4 THEN INTERVAL '300 seconds' \
                      WHEN claim_attempts + 1 = 5 THEN INTERVAL '600 seconds' \
                      WHEN claim_attempts + 1 = 6 THEN INTERVAL '1800 seconds' \

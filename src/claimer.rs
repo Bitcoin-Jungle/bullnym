@@ -34,6 +34,8 @@ use crate::ip_whitelist;
 use crate::utxo::UtxoBackend;
 use crate::AppState;
 
+const CLAIM_SWEEP_INTERVAL_SECS: u64 = 10;
+
 #[derive(Deserialize)]
 struct WebhookEnvelope {
     data: WebhookData,
@@ -529,7 +531,7 @@ pub enum ClaimOutcome {
 /// The previous implementation looped 3 times with 2s delays inside the
 /// webhook handler. That blocked the response to Boltz for up to ~10
 /// seconds (Boltz's webhook timeout is 15s) and overlapped poorly with
-/// the background sweep's 30s tick — every webhook produced 4 claim
+/// the background sweep's retry tick — every webhook produced 4 claim
 /// attempts before the sweep even started.
 async fn try_claim_with_retry(
     pool: &sqlx::PgPool,
@@ -1604,9 +1606,9 @@ pub fn spawn_background_claimer(
         let mut first_run = true;
         // Heartbeat counter. Log liveness every N ticks so "is the
         // background claimer running?" is a grep-able question, not a
-        // process-tree archaeology one. At 30s/tick × 10 ticks, that's
+        // process-tree archaeology one. At 10s/tick x 30 ticks, that's
         // every 5 minutes — same cadence as the rate-limit GC.
-        const HEARTBEAT_EVERY_N_TICKS: u32 = 10;
+        const HEARTBEAT_EVERY_N_TICKS: u32 = 30;
         let mut tick_count: u32 = 0;
         loop {
             tick_count = tick_count.wrapping_add(1);
@@ -1616,7 +1618,7 @@ pub fn spawn_background_claimer(
                     tracing::error!("background claimer: db query failed: {e}");
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
+                        _ = tokio::time::sleep(Duration::from_secs(CLAIM_SWEEP_INTERVAL_SECS)) => continue,
                     }
                 }
             };
@@ -1736,7 +1738,7 @@ pub fn spawn_background_claimer(
                     tracing::info!("background claimer: shutting down");
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(CLAIM_SWEEP_INTERVAL_SECS)) => {}
             }
         }
     });
