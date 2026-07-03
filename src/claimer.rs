@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use lwk_wollet::elements;
 
+use boltz_client::elements as boltz_elements;
 use boltz_client::network::electrum::ElectrumLiquidClient;
 use boltz_client::network::{BitcoinChain, Chain, LiquidChain};
 use boltz_client::swaps::boltz::{
@@ -1557,8 +1558,9 @@ async fn recover_claim_from_lockup_spend(
     };
 
     let raw_spending = backend.get_raw_tx(&spending_txid).await?;
-    let spending_tx: elements::Transaction = elements::encode::deserialize(&raw_spending)
-        .map_err(|e| AppError::ClaimError(format!("decode spending tx: {e}")))?;
+    let spending_tx: boltz_elements::Transaction =
+        boltz_elements::encode::deserialize(&raw_spending)
+            .map_err(|e| AppError::ClaimError(format!("decode spending tx: {e}")))?;
     if !spending_tx_matches_claim_destination(&spending_tx, tx) {
         return Err(AppError::ClaimError(format!(
             "lockup spent by {spending_txid}, but spender does not pay the claim destination"
@@ -1569,8 +1571,8 @@ async fn recover_claim_from_lockup_spend(
 }
 
 fn spending_tx_matches_claim_destination(
-    spending_tx: &elements::Transaction,
-    claim_tx: &elements::Transaction,
+    spending_tx: &boltz_elements::Transaction,
+    claim_tx: &boltz_elements::Transaction,
 ) -> bool {
     claim_tx.output.iter().any(|claim_output| {
         !claim_output.script_pubkey.is_empty()
