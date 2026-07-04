@@ -12,15 +12,13 @@ fn save_payload_fields_fixed_order() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
         Some(TEST_DESCRIPTOR),
     );
-    assert_eq!(fields.len(), 9);
+    assert_eq!(fields.len(), 8);
     assert_eq!(fields[0], "Alice's Coffee");
     assert_eq!(fields[2], "USD");
     assert_eq!(fields[6], "1");
-    assert_eq!(fields[7], "0");
-    assert_eq!(fields[8], TEST_DESCRIPTOR);
+    assert_eq!(fields[7], TEST_DESCRIPTOR);
 }
 
 #[test]
@@ -33,30 +31,10 @@ fn save_payload_fields_omit_descriptor() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
         None,
     );
-    assert_eq!(fields.len(), 8);
+    assert_eq!(fields.len(), 7);
     assert_eq!(fields[6], "1");
-    assert_eq!(fields[7], "0");
-}
-
-#[test]
-fn save_payload_fields_legacy_without_pos_mode() {
-    let fields = save_payload_fields(
-        "Alice's Coffee",
-        "Buy me a coffee!",
-        "USD",
-        "https://alice.example",
-        "alice",
-        "alice_ig",
-        "1",
-        None,
-        Some(TEST_DESCRIPTOR),
-    );
-    assert_eq!(fields.len(), 8);
-    assert_eq!(fields[6], "1");
-    assert_eq!(fields[7], TEST_DESCRIPTOR);
 }
 
 /// Byte-exact contract test for the v2 signing protocol.
@@ -74,7 +52,6 @@ fn v2_save_message_byte_exact_contract() {
         "alice",
         "alice_ig",
         "1",
-        Some("0"),
         Some(TEST_DESCRIPTOR),
     );
     let npub = "00".repeat(32);
@@ -97,42 +74,6 @@ fn v2_save_message_byte_exact_contract() {
     expected.extend_from_slice(b"1700000000");
 
     assert_eq!(msg, expected, "v2 byte order regression");
-    assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 13);
-}
-
-#[test]
-fn v2_save_message_legacy_without_pos_mode_byte_exact_contract() {
-    let fields = save_payload_fields(
-        "Alice's Coffee",
-        "Buy me a coffee!",
-        "USD",
-        "https://alice.example",
-        "alice",
-        "alice_ig",
-        "1",
-        None,
-        Some(TEST_DESCRIPTOR),
-    );
-    let npub = "00".repeat(32);
-    let timestamp: u64 = 1_700_000_000;
-    let msg = crate::auth::build_la_v2_message(ACTION_SAVE, &npub, "alice", &fields, timestamp);
-
-    let mut expected: Vec<u8> = Vec::new();
-    expected.extend_from_slice(b"bullpay-la-v2");
-    expected.push(0);
-    expected.extend_from_slice(b"donation-page-save");
-    expected.push(0);
-    expected.extend_from_slice(npub.as_bytes());
-    expected.push(0);
-    expected.extend_from_slice(b"alice");
-    expected.push(0);
-    for f in &fields {
-        expected.extend_from_slice(f.as_bytes());
-        expected.push(0);
-    }
-    expected.extend_from_slice(b"1700000000");
-
-    assert_eq!(msg, expected, "v2 legacy byte order regression");
     assert_eq!(msg.iter().filter(|&&b| b == 0).count(), 12);
 }
 
@@ -198,7 +139,6 @@ fn make_req() -> SaveDonationPageRequest {
         website: Some("https://example.com".to_string()),
         twitter: Some("alice".to_string()),
         instagram: Some("alice.ig".to_string()),
-        pos_mode: Some(false),
         enabled: true,
         timestamp: 0,
         signature: String::new(),

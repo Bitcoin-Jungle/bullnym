@@ -10,9 +10,10 @@
   // whole/frac minor-unit accumulator.
   import { History, Settings } from 'lucide-svelte'
   import { config } from '$lib/config'
-  import { createInvoice, getSupportedCurrencies, type CurrencyView, ApiError } from '$lib/api/client'
+  import { createTerminalInvoice, getSupportedCurrencies, type CurrencyView, ApiError } from '$lib/api/client'
   import { rate } from '$lib/stores/rate.svelte'
   import { settings } from '$lib/stores/settings.svelte'
+  import { terminal } from '$lib/stores/terminal.svelte'
   import { router } from '$lib/router.svelte'
   import { cacheInvoice } from '$lib/stores/invoiceCache'
   import { applyAmountInput } from '$lib/amount-input'
@@ -21,6 +22,10 @@
   import RateBar from '$lib/components/RateBar.svelte'
   import BullFooter from '$lib/components/BullFooter.svelte'
   import Button from '$lib/components/Button.svelte'
+
+  // Server-enforced cap (src/invoice.rs's POS_MEMO_MAX) — mirrored here so
+  // the merchant sees the limit before submitting, not after a rejection.
+  const MEMO_MAX = 280
 
   let currencies = $state<CurrencyView[]>([{ code: settings.currency, precision: 2 }])
   let amount = $state('')
@@ -54,12 +59,18 @@
 
   async function charge() {
     if (!canCharge) return
+    if (!terminal.token) {
+      errorMsg = 'Terminal not paired'
+      return
+    }
     creating = true
     errorMsg = null
     try {
-      const res = await createInvoice(config.nym, {
+      const trimmedNote = note.trim()
+      const res = await createTerminalInvoice(config.nym, terminal.token, {
         fiat_amount_minor: minor,
         fiat_currency: settings.currency,
+        memo: trimmedNote.length > 0 ? trimmedNote.slice(0, MEMO_MAX) : undefined,
       })
       cacheInvoice({
         invoice: res,
@@ -130,6 +141,7 @@
           bind:value={note}
           placeholder="Add note"
           rows="1"
+          maxlength={MEMO_MAX}
         ></textarea>
         <RateBar {precision} />
         {#if errorMsg}

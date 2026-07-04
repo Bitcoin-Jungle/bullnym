@@ -19,7 +19,7 @@ live in feature modules such as `registration`, `lnurl`, `donation_page`, and
 | `POST` | `/register` | Schnorr signed | Register a nym, Lightning Address descriptor, and optional `verification_npub`. |
 | `PUT` | `/register` | Schnorr signed | Update the Lightning Address descriptor for the caller's nym. |
 | `DELETE` | `/register` | Schnorr signed | Deactivate a nym while preserving the reservation. |
-| `GET` | `/register/lookup?npub=...` | Public, rate-limited | Return active and inactive nyms for an owner key. |
+| `GET` | `/register/lookup?npub=...` | Public, rate-limited | Return active and inactive nyms for an owner key. Includes `lightning_address` (`nym@domain`) when the nym is active, `null` otherwise. |
 | `GET` | `/api/reservations/:nym` | Public, rate-limited | Inspect pending LUD-22 reservations for a nym. |
 
 ## Donation Pages

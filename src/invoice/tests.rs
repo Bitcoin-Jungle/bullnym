@@ -162,6 +162,58 @@ fn boltz_invoice_description_hashes_url_when_too_long() {
 }
 
 #[test]
+fn boltz_invoice_description_uses_public_short_ascii_memo() {
+    let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
+    let mut inv = invoice_fixture();
+    inv.memo = Some("Two coffees".to_string());
+    inv.memo_public = true;
+
+    let description = boltz_invoice_description_for_invoice(url, &inv);
+
+    assert_eq!(description.description.as_deref(), Some("Two coffees"));
+    assert!(description.description_hash.is_none());
+}
+
+#[test]
+fn boltz_invoice_description_falls_back_for_public_non_ascii_memo() {
+    let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
+    let mut inv = invoice_fixture();
+    inv.memo = Some("cafe con leche".replace('e', "é"));
+    inv.memo_public = true;
+
+    let description = boltz_invoice_description_for_invoice(url, &inv);
+
+    assert_eq!(description.description.as_deref(), Some(url));
+    assert!(description.description_hash.is_none());
+}
+
+#[test]
+fn boltz_invoice_description_falls_back_for_public_long_memo() {
+    let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
+    let mut inv = invoice_fixture();
+    inv.memo = Some("a".repeat(101));
+    inv.memo_public = true;
+
+    let description = boltz_invoice_description_for_invoice(url, &inv);
+
+    assert_eq!(description.description.as_deref(), Some(url));
+    assert!(description.description_hash.is_none());
+}
+
+#[test]
+fn boltz_invoice_description_never_leaks_private_memo() {
+    let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
+    let mut inv = invoice_fixture();
+    inv.memo = Some("private wallet memo".to_string());
+    inv.memo_public = false;
+
+    let description = boltz_invoice_description_for_invoice(url, &inv);
+
+    assert_eq!(description.description.as_deref(), Some(url));
+    assert!(description.description_hash.is_none());
+}
+
+#[test]
 fn append_bip21_message_adds_encoded_invoice_url() {
     let bip21 = "bitcoin:bc1qboltzlockup?amount=0.00010000&label=Send%20to%20L-BTC%20address";
     let url = "https://bullpay.ca/alice/i/00000000-0000-0000-0000-000000000000";
@@ -198,6 +250,7 @@ fn partially_paid_template_remains_payable_for_remaining_amount() {
         public_description: None,
         recipient_name: None,
         invoice_number: None,
+        memo: None,
         accept_btc: true,
         accept_ln: true,
         accept_liquid: true,
@@ -231,6 +284,7 @@ fn template_refreshes_lightning_explicitly_when_status_has_no_reusable_pr() {
         public_description: None,
         recipient_name: None,
         invoice_number: None,
+        memo: None,
         accept_btc: false,
         accept_ln: true,
         accept_liquid: true,
@@ -264,6 +318,7 @@ fn template_exposes_boltz_chain_bitcoin_without_direct_btc_address() {
         public_description: None,
         recipient_name: None,
         invoice_number: None,
+        memo: None,
         accept_btc: false,
         accept_ln: true,
         accept_liquid: true,
@@ -301,6 +356,7 @@ fn template_liquid_uri_pins_lbtc_asset() {
         public_description: None,
         recipient_name: None,
         invoice_number: None,
+        memo: None,
         accept_btc: false,
         accept_ln: false,
         accept_liquid: true,
@@ -335,6 +391,7 @@ fn invoice_template_escapes_user_text_and_js_literals() {
         public_description: Some(attack),
         recipient_name: Some(attack),
         invoice_number: Some(attack),
+        memo: Some(attack),
         accept_btc: true,
         accept_ln: false,
         accept_liquid: false,
@@ -352,6 +409,68 @@ fn invoice_template_escapes_user_text_and_js_literals() {
     assert!(html.contains("&lt;/script&gt;"));
     assert!(html.contains("\\u003c/script\\u003e"));
     assert!(html.contains("\\u0026"));
+}
+
+#[test]
+fn template_renders_public_memo_as_receipt_line() {
+    let tpl = InvoicePaymentTpl {
+        nym: "alice",
+        is_unlinked: false,
+        invoice_id: Uuid::nil().to_string(),
+        domain: "bullpay.ca",
+        status: "unpaid",
+        settlement_status: "none",
+        amount_sat: 10_000,
+        remaining_amount_sat: 10_000,
+        fiat_display: None,
+        public_description: None,
+        recipient_name: None,
+        invoice_number: None,
+        memo: Some("Two coffees"),
+        accept_btc: false,
+        accept_ln: false,
+        accept_liquid: true,
+        bitcoin_chain_address: None,
+        bitcoin_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
+    };
+
+    let html = tpl.render().expect("template renders");
+    assert!(html.contains("Memo: Two coffees"));
+}
+
+#[test]
+fn unlinked_template_can_stay_memo_free() {
+    let tpl = InvoicePaymentTpl {
+        nym: "",
+        is_unlinked: true,
+        invoice_id: Uuid::nil().to_string(),
+        domain: "bullpay.ca",
+        status: "unpaid",
+        settlement_status: "none",
+        amount_sat: 10_000,
+        remaining_amount_sat: 10_000,
+        fiat_display: None,
+        public_description: None,
+        recipient_name: None,
+        invoice_number: None,
+        memo: None,
+        accept_btc: false,
+        accept_ln: false,
+        accept_liquid: true,
+        bitcoin_chain_address: None,
+        bitcoin_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_address_js: js_string_literal(None).unwrap(),
+        bitcoin_chain_bip21_js: js_string_literal(None).unwrap(),
+        liquid_address_js: js_string_literal(Some("lq1qqexample")).unwrap(),
+        liquid_btc_asset_id: LIQUID_BTC_ASSET_ID,
+    };
+
+    let html = tpl.render().expect("template renders");
+    assert!(!html.contains("Memo:"));
 }
 
 #[test]
@@ -387,6 +506,8 @@ fn invoice_fixture() -> db::Invoice {
         amount_sat: 10_000,
         rate_minor_per_btc: None,
         memo: None,
+        terminal_id: None,
+        memo_public: false,
         recipient_label: None,
         bitcoin_address: None,
         accept_btc: false,

@@ -177,6 +177,10 @@
             {% when Some with (d) %}<div class="meta">{{ d }}</div>
             {% when None %}
         {% endmatch %}
+        {% match memo %}
+            {% when Some with (m) %}<div class="meta">Memo: {{ m }}</div>
+            {% when None %}
+        {% endmatch %}
 
         {# Accepted-rails badge. The QR/copy card below reveals only the
            currently selected rail, defaulting to Lightning when available. #}

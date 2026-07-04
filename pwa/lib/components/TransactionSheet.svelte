@@ -1,17 +1,20 @@
 <script lang="ts">
   // Ported from nostr-pos
   // (~/apps/nostr-pos/apps/pos-pwa/src/lib/ui/TransactionSheet.svelte).
-  // Same markup/classes; `rows` is our HistoryRecord[]
-  // (lib/stores/history.svelte.ts) instead of upstream's TransactionRow[]
-  // (Sale + PaymentAttempt), and method label comes from our lib/rails.ts
-  // instead of upstream's methodLabel(PaymentMethod).
+  // Same markup/classes; `rows` is now the server's PosInvoiceListItem[]
+  // (GET /:nym/pos/invoices, lib/api/client.ts) instead of the old
+  // localStorage-only HistoryRecord[] — history is server-backed now (see
+  // apps/pos/screens/HistoryScreen.svelte), so this renders across devices
+  // and survives a local reset. Method label comes from our lib/rails.ts
+  // instead of upstream's methodLabel(PaymentMethod); amount formatting
+  // resolves the real currency precision via lib/pos-history.ts.
   import { ChevronRight } from 'lucide-svelte'
-  import type { HistoryRecord } from '$lib/stores/history.svelte'
-  import { formatFiat } from '$lib/money'
+  import type { PosInvoiceListItem, CurrencyView } from '$lib/api/client'
+  import { invoiceAmountLabel } from '$lib/pos-history'
   import { railLabel } from '$lib/rails'
   import { isTerminalPaid, statusBorderTone, statusLabel } from '$lib/status'
 
-  let { rows }: { rows: HistoryRecord[] } = $props()
+  let { rows, currencies = [] }: { rows: PosInvoiceListItem[]; currencies?: CurrencyView[] } = $props()
 </script>
 
 <section>
@@ -31,7 +34,7 @@
           <div class="min-w-0">
             <div class="flex items-baseline gap-2">
               <span class="font-black tabular-nums">
-                {row.currency ? formatFiat(row.amount_fiat_minor ?? 0, row.currency, row.precision) : '—'}
+                {invoiceAmountLabel(row, currencies)}
               </span>
               {#if !isTerminalPaid(row.status)}
                 <span class="text-xs font-semibold text-[#776b5a] dark:text-[#b9aa91]">{statusLabel(row.status)}</span>
@@ -46,7 +49,7 @@
                     minute: '2-digit',
                   })
                 : '—'}
-              &middot; {railLabel(row.rail)}
+              &middot; {railLabel(row.paid_via)}
             </div>
           </div>
           <ChevronRight size={18} class="text-[#b1a287] dark:text-[#6d634f]" />

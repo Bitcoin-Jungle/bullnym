@@ -380,6 +380,10 @@ pub struct LookupResponse {
     /// read `previous_nyms`.
     pub nym: String,
     pub active: bool,
+    /// Full copyable address (`nym@domain`) when `active == true`, else
+    /// `None` — an inactive nym has no working address. Mobile shows this
+    /// on the status screen so it doesn't have to synthesize the domain.
+    pub lightning_address: Option<String>,
     pub quota: QuotaView,
     /// All inactive nyms for this npub, most-recent first.
     pub previous_nyms: Vec<db::PreviousNym>,
@@ -426,9 +430,11 @@ pub async fn lookup_by_npub(
     let cap = state.config.limits.max_lifetime_nyms_per_npub;
     let quota = QuotaView::new(used, cap);
     if let Some(nym) = active_nym {
+        let lightning_address = format!("{}@{}", nym, state.config.domain);
         return Ok(Json(LookupResponse {
             nym,
             active: true,
+            lightning_address: Some(lightning_address),
             quota,
             previous_nyms,
             lifetime_nyms_used: used,
@@ -440,6 +446,7 @@ pub async fn lookup_by_npub(
         return Ok(Json(LookupResponse {
             nym,
             active: false,
+            lightning_address: None,
             quota,
             previous_nyms,
             lifetime_nyms_used: used,

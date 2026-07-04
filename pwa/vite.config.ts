@@ -55,9 +55,9 @@ function bullnymServiceWorkerPrecache(): Plugin {
   }
 }
 
-// Two entry points, one workspace. The Rust server picks the shell to
-// serve based on donation_pages.pos_mode and injects the config JSON in
-// place of the <!-- BULLNYM_CONFIG --> placeholder.
+// Two entry points, one workspace. The Rust server picks the shell by
+// route (donation at /<nym>, POS at /<nym>/pos) and injects the config
+// JSON in place of the <!-- BULLNYM_CONFIG --> placeholder.
 //
 // base is /pwa-assets/ so hashed assets resolve regardless of which
 // /<nym> path the shell is served under. The Rust router mounts
@@ -85,6 +85,7 @@ export default defineConfig({
       '/api': 'http://127.0.0.1:8080',
       '/.well-known': 'http://127.0.0.1:8080',
       '^/[a-z0-9-]+/invoice$': 'http://127.0.0.1:8080',
+      '^/[a-z0-9-]+/pos/': 'http://127.0.0.1:8080',
     },
   },
 })

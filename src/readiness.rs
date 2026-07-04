@@ -120,6 +120,12 @@ async fn schema_marker_present(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error>
                 WHERE table_schema = 'public' \
                   AND table_name = 'donation_pages' \
                   AND column_name = 'next_addr_idx' \
+            ) \
+            AND EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'donation_pages' \
+                  AND column_name = 'pos_ct_descriptor' \
             )",
     )
     .fetch_one(pool)

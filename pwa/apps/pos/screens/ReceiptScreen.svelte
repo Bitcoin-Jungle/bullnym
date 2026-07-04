@@ -2,18 +2,24 @@
   // Reskinned to nostr-pos's Receipt.svelte
   // (~/apps/nostr-pos/apps/pos-pwa/src/routes/Receipt.svelte): back link +
   // Print/Share (or New sale) actions, ReceiptView card, paid/status
-  // banner below. Paper-size handling (58mm/80mm/A4) and the fallback to
-  // GET /api/v1/invoices/:id/status are our additions — upstream is
-  // 80mm-only and always has local IndexedDB data, no server fallback.
-  import { untrack } from 'svelte'
-  import { Printer, RotateCw, Share2 } from 'lucide-svelte'
+  // banner below. Paper-size handling (58mm/80mm/A4) is our addition —
+  // upstream is 80mm-only.
+  //
+  // Server-authoritative now: history is no longer a local store (see
+  // .context/pos-terminal-plan.md), so this always loads from
+  // GET /api/v1/invoices/:id/status — including the memo, which the server
+  // only returns when memo_public (true for terminal-created invoices,
+  // regardless of lifecycle state). That means a receipt reloads correctly
+  // cross-device, after a local reset, and in any invoice state — there is
+  // no local cache to fall back on.
   import { config } from '$lib/config'
-  import { history } from '$lib/stores/history.svelte'
-  import { getInvoiceStatus, getSupportedCurrencies } from '$lib/api/client'
+  import { getInvoiceStatus, getSupportedCurrencies, type InvoiceStatus } from '$lib/api/client'
+  import { precisionFor } from '$lib/pos-history'
   import { formatFiat, formatSats, shortId } from '$lib/money'
   import { router } from '$lib/router.svelte'
   import { railLabel } from '$lib/rails'
   import { isTerminalPaid, statusLabel as statusLabelFor } from '$lib/status'
+  import { Printer, RotateCw, Share2 } from 'lucide-svelte'
   import Button from '$lib/components/Button.svelte'
   import ReceiptView from '$lib/components/ReceiptView.svelte'
 
@@ -33,38 +39,15 @@
 
   const paperSize = loadPaperSize()
 
-  const record = untrack(() => history.find(id))
-
-  let fallback = $state<{
-    fiat_amount_minor: number | null
-    fiat_currency: string | null
-    amount_sat: number
-    paid_via: string | null
-    paid_at_unix: number | null
-    precision: number
-    status: string
-  } | null>(null)
+  let status = $state<InvoiceStatus | null>(null)
+  let precision = $state(2)
   let notFound = $state(false)
 
   $effect(() => {
-    if (record) return
-    // Not in local history (cleared, different device, direct navigation).
-    // Resolve precision from the currency's real precision rather than
-    // hardcoding — CRC (precision 0) is the primary market, and defaulting
-    // to 2 here would silently misprint amounts by 100x on paper.
     Promise.all([getInvoiceStatus(id), getSupportedCurrencies().catch(() => null)])
       .then(([s, currencies]) => {
-        const currency = s.fiat_currency ?? config.currency
-        const match = currencies?.currencies.find((c) => c.code === currency)
-        fallback = {
-          fiat_amount_minor: s.fiat_amount_minor,
-          fiat_currency: currency,
-          amount_sat: s.paid_amount_sat ?? s.amount_sat,
-          paid_via: s.paid_via,
-          paid_at_unix: s.paid_at_unix,
-          precision: match?.precision ?? 2,
-          status: s.status,
-        }
+        status = s
+        precision = precisionFor(s.fiat_currency, currencies?.currencies ?? [])
       })
       .catch(() => {
         notFound = true
@@ -77,15 +60,14 @@
     return `${last6.slice(0, 2)}-${last6.slice(2)}`
   })
 
-  const precision = $derived(record?.precision ?? fallback?.precision ?? 2)
-  const amountMinor = $derived(record?.amount_fiat_minor ?? fallback?.fiat_amount_minor ?? 0)
-  const currency = $derived(record?.currency ?? fallback?.fiat_currency ?? config.currency)
-  const amountSat = $derived(record?.amount_sat ?? fallback?.amount_sat ?? 0)
-  const rail = $derived(record?.rail ?? fallback?.paid_via ?? null)
-  const paidAtUnix = $derived(record?.paid_at_unix ?? fallback?.paid_at_unix ?? null)
-  const note = $derived(record?.note ?? '')
-  const status = $derived(record?.status ?? fallback?.status ?? 'pending')
-  const isPaid = $derived(isTerminalPaid(status))
+  const amountMinor = $derived(status?.fiat_amount_minor ?? 0)
+  const currency = $derived(status?.fiat_currency ?? config.currency)
+  const amountSat = $derived(status?.paid_amount_sat ?? status?.amount_sat ?? 0)
+  const rail = $derived(status?.paid_via ?? null)
+  const paidAtUnix = $derived(status?.paid_at_unix ?? null)
+  const note = $derived(status?.memo ?? '')
+  const statusStr = $derived(status?.status ?? 'pending')
+  const isPaid = $derived(isTerminalPaid(statusStr))
 
   const dateLabel = $derived(paidAtUnix ? new Date(paidAtUnix * 1000).toLocaleString() : '—')
 
@@ -134,6 +116,8 @@
 
   {#if notFound}
     <p class="py-20 text-center">Receipt not found.</p>
+  {:else if !status}
+    <p class="py-20 text-center">Loading receipt…</p>
   {:else}
     <ReceiptView
       merchantName={config.header || config.nym}
@@ -141,7 +125,7 @@
       receiptNumber={receiptNo}
       {dateLabel}
       methodLabel={railLabel(rail)}
-      statusLabel={statusLabelFor(status)}
+      statusLabel={statusLabelFor(statusStr)}
       amountSatsLabel={formatSats(amountSat)}
       amountFiatLabel={formatFiat(amountMinor, currency, precision)}
       {note}
@@ -153,7 +137,7 @@
           isPaid ? 'bg-[#d9f3df] text-[#14522d]' : 'bg-[#fff0c7] text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]'
         }`}
       >
-        <p class="font-display text-5xl uppercase tracking-display leading-none">{isPaid ? 'Paid' : statusLabelFor(status)}</p>
+        <p class="font-display text-5xl uppercase tracking-display leading-none">{isPaid ? 'Paid' : statusLabelFor(statusStr)}</p>
         <p class="mt-1 text-sm">
           {#if isPaid}
             Receipt ready.

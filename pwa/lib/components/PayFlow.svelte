@@ -45,11 +45,12 @@
     successSecondaryLabel?: string
     onSuccessSecondary?: () => void
     /**
-     * POS: history.add(...) — fires for BOTH paid and overpaid (money WAS
-     * received). Donation: omitted. Receives the full loaded context (note/
-     * precision/currency/fiatAmountMinor) alongside the terminal status
-     * since HistoryRecord needs fields InvoiceStatus alone can't always
-     * supply (precision, the merchant note) — see PayScreen.svelte's onPaid.
+     * Fires for BOTH paid and overpaid (money WAS received). History is
+     * server-backed now (GET /:nym/pos/invoices) — no caller currently
+     * needs this for a local side effect, but the hook stays: it's the one
+     * place PayFlow reports "this invoice reached a paid terminal state"
+     * with the full loaded context (note/precision/currency/fiatAmountMinor)
+     * alongside the server status, which InvoiceStatus alone can't supply.
      */
     onPaid?: (status: InvoiceStatus, ctx: CachedInvoice) => void
     /** Navigate back to the entry screen ('/'). Called automatically ~1.8s after an 'expired' terminal state (matching the pre-rewrite POS grace period), and by every other terminal panel's action button. */

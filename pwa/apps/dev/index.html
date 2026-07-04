@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>bullnym — P1 dev harness</title>
+    <!-- Dev-only harness for the chain-swap rail-gating fix (P1). Mounts
+         PaymentScreen directly against a stubbed backend that returns the
+         regression status: accept_btc=false + a BTC->L-BTC chain-swap
+         address present. The Bitcoin tab must stay visible after the first
+         poll. Not part of the production build (apps/donation + apps/pos). -->
+    <script id="bullnym-config" type="application/json">
+      {
+        "nym": "devtest",
+        "mode": "donation",
+        "currency": "USD",
+        "header": "Dev Harness",
+        "description": "P1 chain-swap rail gating",
+        "minor_per_btc": 6500000,
+        "last_known_rate": false,
+        "domain": "localhost"
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

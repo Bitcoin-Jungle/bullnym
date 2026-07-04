@@ -88,6 +88,7 @@ const SAT_PER_BTC: i64 = 100_000_000;
 const PUBLIC_DESCRIPTION_MAX: usize = 1000;
 const RECIPIENT_LABEL_MAX: usize = 100;
 const INVOICE_NUMBER_MAX: usize = 50;
+pub(crate) const POS_MEMO_MAX: usize = 280;
 pub(crate) const LIQUID_BTC_ASSET_ID: &str =
     "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d";
 
@@ -441,6 +442,33 @@ pub async fn create_anonymous(
     headers: HeaderMap,
     Json(req): Json<CreateAnonymousRequest>,
 ) -> Result<Json<CreateInvoiceResponse>, AppError> {
+    create_checkout_invoice_inner(
+        &state,
+        nym,
+        peer_opt,
+        headers,
+        req,
+        CheckoutInvoiceOptions {
+            terminal_id: None,
+            memo: None,
+        },
+    )
+    .await
+}
+
+pub(crate) struct CheckoutInvoiceOptions {
+    pub terminal_id: Option<Uuid>,
+    pub memo: Option<String>,
+}
+
+pub(crate) async fn create_checkout_invoice_inner(
+    state: &AppState,
+    nym: String,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    req: CreateAnonymousRequest,
+    options: CheckoutInvoiceOptions,
+) -> Result<Json<CreateInvoiceResponse>, AppError> {
     let peer = peer_opt.map(|ConnectInfo(addr)| addr);
     let ip = ip_whitelist::caller_ip(peer, &headers, state.config.rate_limit.trust_forwarded_for);
     let is_whitelisted = ip
@@ -455,7 +483,7 @@ pub async fn create_anonymous(
         Some(&nym),
     );
 
-    if !is_whitelisted && !is_certification_allowed {
+    if options.terminal_id.is_none() && !is_whitelisted && !is_certification_allowed {
         if let Some(ip) = ip {
             state
                 .rate_limiter
@@ -472,17 +500,20 @@ pub async fn create_anonymous(
     let page = db::get_donation_page_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
-    if !page.enabled || page.is_archived {
+    if page.is_archived || (!page.enabled && options.terminal_id.is_none()) {
         return Err(AppError::DonationPageNotFound(nym.clone()));
     }
     let owner = db::get_active_user_by_nym(&state.db, &nym)
         .await?
         .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
 
-    // Eagerly allocate a Liquid address from the donation page owner's
-    // CT descriptor. Donation Page checkout never uses customer- or
-    // merchant-supplied payout addresses; every customer-facing settlement
-    // rail resolves back to this descriptor-derived Liquid address:
+    // Eagerly allocate a Liquid address from the owner's CT descriptor —
+    // the POS descriptor for terminal invoices, the donation-page
+    // descriptor otherwise (fund separation; see
+    // docs/features/pos-terminals.md "Fund Separation"). Checkout never
+    // uses customer- or merchant-supplied payout addresses; every
+    // customer-facing settlement rail resolves back to this
+    // descriptor-derived Liquid address:
     //   - Lightning: `claimer::resolve_claim_address` branch (B) routes
     //     the Boltz claim to `invoice.liquid_address` once
     //     `create_lightning_offer` (below) binds the swap to this invoice.
@@ -494,7 +525,14 @@ pub async fn create_anonymous(
     // The `invoices_ln_or_liquid_addr_chk` constraint requires
     // `liquid_address` to be present at insert time when either LN or
     // Liquid is accepted, so allocation must run BEFORE insert.
-    let (liquid_address, _liquid_index, payment_descriptor) =
+    let (liquid_address, _liquid_index, payment_descriptor) = if options.terminal_id.is_some() {
+        db::allocate_next_liquid_for_pos_terminal(&state.db, &nym, |ct_descriptor, idx| {
+            descriptor::derive_address(ct_descriptor, idx)
+                .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
+        })
+        .await?
+        .ok_or_else(|| AppError::PosDescriptorRequired(nym.clone()))?
+    } else {
         match db::allocate_next_liquid_for_donation_page(&state.db, &nym, |ct_descriptor, idx| {
             descriptor::derive_address(ct_descriptor, idx)
                 .map_err(|e| sqlx::Error::Protocol(format!("derive_address: {e}")))
@@ -515,7 +553,8 @@ pub async fn create_anonymous(
                 .ok_or_else(|| AppError::DonationPageNotFound(nym.clone()))?;
                 (address, index, owner.ct_descriptor.clone())
             }
-        };
+        }
+    };
     let liquid_blinding_key_hex =
         descriptor::derive_blinding_key_hex(&payment_descriptor, &liquid_address)?;
 
@@ -528,7 +567,9 @@ pub async fn create_anonymous(
         amount_sat,
         rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
         rate_lock_secs: CHECKOUT_DEFAULT_EXPIRES_SECS,
-        memo: None,
+        memo: options.memo.as_deref(),
+        terminal_id: options.terminal_id,
+        memo_public: options.memo.is_some(),
         recipient_label: None,
         public_description: None,
         invoice_number: None,
@@ -588,6 +629,27 @@ pub async fn create_anonymous(
         bitcoin_chain_bip21: bitcoin_chain_offer.and_then(|offer| offer.lockup_bip21),
         expires_at_unix: invoice.expires_at_unix,
     }))
+}
+
+pub(crate) fn validate_pos_memo(memo: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(memo) = memo else {
+        return Ok(None);
+    };
+    if memo.chars().any(|c| c.is_control()) {
+        return Err(AppError::InvalidAmount(
+            "memo must not contain control characters".into(),
+        ));
+    }
+    if memo.chars().count() > POS_MEMO_MAX {
+        return Err(AppError::InvalidAmount(format!(
+            "memo too long (max {POS_MEMO_MAX} chars)"
+        )));
+    }
+    if memo.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(memo.to_string()))
+    }
 }
 
 /// Validate the create-anonymous body and resolve the requested amount.
@@ -707,6 +769,7 @@ struct InvoicePaymentTpl<'a> {
     public_description: Option<&'a str>,
     recipient_name: Option<&'a str>,
     invoice_number: Option<&'a str>,
+    memo: Option<&'a str>,
     accept_btc: bool,
     accept_ln: bool,
     accept_liquid: bool,
@@ -817,6 +880,10 @@ async fn render_invoice_template(state: &AppState, inv: &db::Invoice) -> Result<
         public_description: inv.public_description.as_deref(),
         recipient_name: inv.recipient_label.as_deref(),
         invoice_number: inv.invoice_number.as_deref(),
+        memo: inv
+            .memo
+            .as_deref()
+            .filter(|_| inv.memo_public && !is_unlinked),
         accept_btc: inv.accept_btc,
         accept_ln: inv.accept_ln,
         accept_liquid: inv.accept_liquid,
@@ -853,6 +920,7 @@ pub struct BitcoinDirectObservationResponse {
 #[derive(Serialize)]
 pub struct InvoiceStatusResponse {
     pub status: String,
+    pub memo: Option<String>,
     pub pricing_mode: String,
     pub settlement_status: String,
     pub amount_sat: i64,
@@ -951,6 +1019,7 @@ pub async fn status(
 
     Ok(Json(InvoiceStatusResponse {
         status: inv.status,
+        memo: inv.memo.filter(|_| inv.memo_public),
         pricing_mode: inv.pricing_mode,
         settlement_status: inv.settlement_status,
         amount_sat: inv.amount_sat,
@@ -1149,7 +1218,7 @@ async fn latest_reusable_lightning_offer(
     }
 }
 
-fn remaining_amount_sat(inv: &db::Invoice) -> i64 {
+pub(crate) fn remaining_amount_sat(inv: &db::Invoice) -> i64 {
     inv.amount_sat
         .saturating_sub(inv.paid_amount_sat.unwrap_or(0))
         .max(0)
@@ -1216,6 +1285,23 @@ fn boltz_invoice_description_for_url(url: &str) -> BoltzInvoiceDescription {
     }
 }
 
+fn boltz_invoice_description_for_invoice(
+    url: &str,
+    invoice: &db::Invoice,
+) -> BoltzInvoiceDescription {
+    if invoice.memo_public {
+        if let Some(memo) = invoice.memo.as_deref() {
+            if memo.is_ascii() && memo.len() <= 100 {
+                return BoltzInvoiceDescription {
+                    description: Some(memo.to_string()),
+                    description_hash: None,
+                };
+            }
+        }
+    }
+    boltz_invoice_description_for_url(url)
+}
+
 fn append_bip21_message(bip21: &str, message: &str) -> String {
     let encoded = percent_encode_query_value(message);
     let (base, query) = match bip21.split_once('?') {
@@ -1269,7 +1355,7 @@ async fn create_lightning_offer(
         invoice.nym_owner.as_deref(),
         invoice.id,
     );
-    let boltz_description = boltz_invoice_description_for_url(&public_url);
+    let boltz_description = boltz_invoice_description_for_invoice(&public_url, invoice);
 
     let result = state
         .boltz
@@ -1432,7 +1518,11 @@ pub async fn fetch_liquid_offer(
 
 /// Verify the signing npub owns `nym` AND the user row is currently
 /// active. Used by the linked create/cancel paths.
-async fn assert_nym_owner(state: &AppState, nym: &str, npub: &str) -> Result<db::User, AppError> {
+pub(crate) async fn assert_nym_owner(
+    state: &AppState,
+    nym: &str,
+    npub: &str,
+) -> Result<db::User, AppError> {
     let user = db::get_user_by_npub(&state.db, npub)
         .await?
         .ok_or_else(|| AppError::AuthError("no active registration for this key".into()))?;
@@ -1744,6 +1834,8 @@ async fn create_invoice_inner(
         rate_minor_per_btc: fiat.as_ref().map(|(_, _, rate)| *rate),
         rate_lock_secs: expires_in_secs,
         memo: None,
+        terminal_id: None,
+        memo_public: false,
         recipient_label: req.recipient_label.as_deref(),
         public_description: req.public_description.as_deref(),
         invoice_number: req.invoice_number.as_deref(),
@@ -1943,6 +2035,8 @@ pub struct InvoiceListItem {
     pub fiat_amount_minor: Option<i32>,
     pub fiat_currency: Option<String>,
     pub public_description: Option<String>,
+    pub memo: Option<String>,
+    pub terminal_id: Option<Uuid>,
     #[serde(rename = "recipient_name")]
     pub recipient_label: Option<String>,
     pub invoice_number: Option<String>,
@@ -2072,6 +2166,8 @@ pub async fn list_signed(
                 fiat_amount_minor: inv.fiat_amount_minor,
                 fiat_currency: inv.fiat_currency,
                 public_description: inv.public_description,
+                memo: inv.memo,
+                terminal_id: inv.terminal_id,
                 recipient_label: inv.recipient_label,
                 invoice_number: inv.invoice_number,
                 accept_btc: inv.accept_btc,

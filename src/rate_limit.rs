@@ -351,6 +351,21 @@ impl RateLimiter {
         )
     }
 
+    /// Per-terminal POS invoice create limit. Terminal auth has already
+    /// resolved the bearer token to a stable terminal id before this gate.
+    pub async fn check_pos_invoice_create_per_terminal(
+        &self,
+        terminal_id: uuid::Uuid,
+    ) -> Result<(), AppError> {
+        let bucket = format!("pos_invoice_create:{terminal_id}");
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.pos_invoice_create_per_terminal_per_5min,
+            300,
+            AppError::RateLimitedSender,
+        )
+    }
+
     /// Per-source rate-limit on public invoice status polling.
     pub async fn check_invoice_status_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
         let bucket = format!("invoice_status:{}", source_key(ip));
@@ -358,6 +373,52 @@ impl RateLimiter {
             &bucket,
             self.cfg.invoice_status_per_source_per_min,
             60,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    /// Strict per-source gate for anonymous POS pairing creation.
+    pub async fn check_pos_pairing_create_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("pos_pair_create:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.pos_pairing_create_per_source_per_hour,
+            3600,
+            AppError::RateLimitedSender,
+        )
+    }
+
+    /// Strict per-source gate recorded only after failed POS claim attempts.
+    pub async fn check_pos_pairing_claim_failure_per_source(
+        &self,
+        ip: IpAddr,
+    ) -> Result<(), AppError> {
+        let bucket = format!("pos_pair_claim_fail:{}", source_key(ip));
+        self.inmem_sliding_peek(
+            &bucket,
+            self.cfg.pos_pairing_claim_failures_per_source_per_hour,
+            3600,
+            AppError::PosPairingClaimRateLimited,
+        )
+    }
+
+    /// Record one failed POS pairing claim after the attempt has failed.
+    pub async fn record_pos_pairing_claim_failure_per_source(&self, ip: IpAddr) {
+        let bucket = format!("pos_pair_claim_fail:{}", source_key(ip));
+        self.inmem_sliding_record(
+            &bucket,
+            self.cfg.pos_pairing_claim_failures_per_source_per_hour,
+            3600,
+        )
+    }
+
+    /// Lenient per-source gate for POS pairing polling.
+    pub async fn check_pos_pairing_poll_per_source(&self, ip: IpAddr) -> Result<(), AppError> {
+        let bucket = format!("pos_pair_poll:{}", source_key(ip));
+        self.inmem_sliding_check(
+            &bucket,
+            self.cfg.pos_pairing_poll_per_source_per_5min,
+            300,
             AppError::RateLimitedSender,
         )
     }
@@ -467,6 +528,48 @@ impl RateLimiter {
         }
     }
 
+    fn inmem_sliding_peek(
+        &self,
+        bucket: &str,
+        limit: u32,
+        window_secs: u32,
+        on_limit: AppError,
+    ) -> Result<(), AppError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        let window = Duration::from_secs(window_secs as u64);
+        let count = self.inmem.peek_count(bucket, window);
+        if count as u32 >= limit {
+            tracing::warn!(
+                event = "rate_limited",
+                bucket = bucket,
+                count = count,
+                limit = limit,
+                window_secs = window_secs,
+                "in-memory sliding-window limit exceeded"
+            );
+            return Err(on_limit);
+        }
+        Ok(())
+    }
+
+    fn inmem_sliding_record(&self, bucket: &str, limit: u32, window_secs: u32) {
+        if limit == 0 {
+            return;
+        }
+        let window = Duration::from_secs(window_secs as u64);
+        let count = self.inmem.record(bucket, window);
+        tracing::debug!(
+            event = "rate_limit_recorded",
+            bucket = bucket,
+            count = count,
+            limit = limit,
+            window_secs = window_secs,
+            "in-memory sliding-window event recorded"
+        );
+    }
+
     /// Atomic Postgres sliding-window check, used for axes where
     /// cross-replica consistency matters (per-pubkey, per-nym Lightning).
     /// A `pg_advisory_xact_lock` keyed on the bucket-string hash
@@ -566,6 +669,23 @@ impl InMemorySliding {
         InmemOutcome::Allowed
     }
 
+    fn peek_count(&self, key: &str, window: Duration) -> usize {
+        let mut entry = self.map.entry(key.to_string()).or_default();
+        let now = Instant::now();
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        prune_old(&mut entry, cutoff);
+        entry.len()
+    }
+
+    fn record(&self, key: &str, window: Duration) -> usize {
+        let mut entry = self.map.entry(key.to_string()).or_default();
+        let now = Instant::now();
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        prune_old(&mut entry, cutoff);
+        entry.push_back(now);
+        entry.len()
+    }
+
     /// Drop entries whose latest timestamp is older than `max_age`.
     /// Returns the number of entries removed.
     fn sweep_idle(&self, max_age: Duration) -> usize {
@@ -578,6 +698,16 @@ impl InMemorySliding {
             deque.back().map(|last| *last >= cutoff).unwrap_or(false)
         });
         before.saturating_sub(self.map.len())
+    }
+}
+
+fn prune_old(deque: &mut VecDeque<Instant>, cutoff: Instant) {
+    while let Some(front) = deque.front() {
+        if *front < cutoff {
+            deque.pop_front();
+        } else {
+            break;
+        }
     }
 }
 

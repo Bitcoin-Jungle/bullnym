@@ -1,6 +1,7 @@
 mod chain_swaps;
 mod donation_pages;
 mod invoices;
+mod pos_terminals;
 mod rate_limits;
 mod reservations;
 mod swaps;
@@ -10,6 +11,7 @@ mod watcher;
 pub use chain_swaps::*;
 pub use donation_pages::*;
 pub use invoices::*;
+pub use pos_terminals::*;
 pub use rate_limits::*;
 pub use reservations::*;
 pub use swaps::*;
