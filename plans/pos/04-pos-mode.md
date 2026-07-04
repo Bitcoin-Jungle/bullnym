@@ -1,7 +1,14 @@
-# POS Mode PWA
+# POS PWA
 
 The cashier-initiated flow. Merchant has a tablet at the counter. Cashier enters an
 amount, customer scans QR or taps Bolt Card, payment completes, receipt prints.
+
+Server update 2026-07-04: POS is no longer selected by a `donation_pages.pos_mode`
+flag. The POS app has its own route at `/<nym>/pos`, with manifest
+`/<nym>/pos/manifest.webmanifest`. Any existing, non-archived payment page can
+host POS terminals. The page `enabled` flag now controls only the public
+donation surface (`/<nym>` and anonymous donation invoices), so POS-only
+merchants use `enabled = false` with paired terminals.
 
 ## Routes
 
@@ -37,7 +44,7 @@ amount, customer scans QR or taps Bolt Card, payment completes, receipt prints.
 - Amount display: large, clear, formatted in display currency
 - Keypad: `1–9`, `00`, `0`, `⌫`. No decimal entry for CRC/whole-unit currencies;
   decimal enabled for USD/CAD/EUR (two decimal places)
-- "Add note": optional text field (stored locally with the invoice record)
+- "Add note": optional memo sent to the server with the terminal invoice
 - "Charge": disabled until amount > 0 and rate is fresh (< 5 min)
 - Recent Transactions: pull-up sheet handle (see history section)
 - [≡ Menu]: PIN-gated settings
@@ -45,7 +52,7 @@ amount, customer scans QR or taps Bolt Card, payment completes, receipt prints.
 ## Charging flow
 
 1. Cashier presses "Charge"
-2. PWA calls `POST /<nym>/invoice` with amount
+2. PWA calls `POST /<nym>/pos/invoice` with amount and optional memo
 3. Navigate to `/#/pay/:id` with the invoice response
 4. Show QR and status
 
@@ -55,7 +62,7 @@ See `05-shared-components.md` — shared with donation mode.
 
 On paid:
 1. Navigate to `/#/receipt/:id`
-2. Save to localStorage history
+2. Refresh server-authoritative invoice status/history
 3. Play success sound + confetti + haptic
 
 "New sale" button → back to `/#/`
@@ -93,8 +100,9 @@ Fields:
 - Print and Share CTAs
 - New Sale
 
-Receipt data stored in localStorage alongside invoice record so reprinting works
-from history without a server round-trip.
+Receipt data comes from server invoice status/history. Terminal-created memos
+are public receipt fields (`memo_public = true`) and are returned by the status
+endpoint when present.
 
 ## Transaction history (`/#/history`)
 
@@ -110,12 +118,14 @@ Recent Transactions
 13:44  ₡1,200   ✓ Paid     Bolt Card
 ```
 
-- Source: localStorage, keyed by nym
-- Stored fields per record: `id`, `amount_fiat`, `currency`, `amount_sat`, `rail`,
-  `status`, `paid_at`, `note`, `rate_used`
+- Source: `GET /<nym>/pos/invoices`, authenticated with the paired terminal token
+- Stored fields come from the server response, including `id`, `fiat_amount_minor`,
+  `fiat_currency`, `amount_sat`, `paid_via`, `status`, `paid_at_unix`, `memo`, and
+  `rate_minor_per_btc`
 - Tap row → receipt screen for that invoice (if paid) or status (if pending)
-- Renders within 100ms from localStorage (no API call on open)
-- Max 200 records kept; oldest pruned on write
+- Renders from cached state first, then refreshes from the server
+- Server paging uses `page` and `pageSize`; the UI can keep only a small in-memory
+  cache
 
 ## Settings screen (`/#/settings`) — PIN-gated
 
@@ -125,16 +135,16 @@ unlocked with a single tap confirmation.
 
 Settings contents:
 - Display currency selector
-- "About this terminal" (nym, server domain)
-- "Clear history" (with confirmation)
+- "About this terminal" (nym, server domain, terminal label/id)
+- "Unpair terminal" (clears local token and returns to the pairing gate)
 - Bolt Card toggle (show/hide NFC tab on payment screen)
-- "Reset terminal" (clears all localStorage)
+- "Reset terminal" (clears local token/cache and returns to the pairing gate)
 
 No relay config, no descriptor, no Nostr — none of that exists here.
 
 ## State management
 
-Three Svelte stores:
+Three Svelte stores plus terminal session state:
 
 ```ts
 // stores/config.ts
@@ -146,8 +156,11 @@ export const config = readable<BullnymConfig>(parseConfig())
 export const currentInvoice = writable<Invoice | null>(null)
 
 // stores/history.ts
-// localStorage-backed, reactive
-export const history = localStorageStore<HistoryRecord[]>('bullnym:history:' + nym, [])
+// Server-backed; cache only the last loaded page in memory
+export const history = writable<HistoryRecord[]>([])
 ```
 
-No IndexedDB, no encryption, no key material. Just plain localStorage.
+The terminal token is client-generated, stored locally, and sent as a bearer
+token after pairing. The server stores only the token hash. The full pairing,
+history, memo, revocation, and 401 re-pair contract is in
+`docs/features/pos-terminals.md`.

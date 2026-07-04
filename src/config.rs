@@ -752,6 +752,19 @@ pub struct RateLimitConfig {
     /// without blocking a legitimate burst. 0 disables the check.
     #[serde(default = "default_invoice_create_per_npub_per_hour")]
     pub invoice_create_per_npub_per_hour: u32,
+    /// Per-terminal rate-limit on POS invoice creation.
+    #[serde(default = "default_pos_invoice_create_per_terminal_per_5min")]
+    pub pos_invoice_create_per_terminal_per_5min: u32,
+
+    /// Per-source rate-limit on anonymous POS pairing creation.
+    #[serde(default = "default_pos_pairing_create_per_source_per_hour")]
+    pub pos_pairing_create_per_source_per_hour: u32,
+    /// Per-source rate-limit on failed POS pairing claim attempts.
+    #[serde(default = "default_pos_pairing_claim_failures_per_source_per_hour")]
+    pub pos_pairing_claim_failures_per_source_per_hour: u32,
+    /// Per-source rate-limit on POS pairing polling.
+    #[serde(default = "default_pos_pairing_poll_per_source_per_5min")]
+    pub pos_pairing_poll_per_source_per_5min: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -804,6 +817,13 @@ impl Default for RateLimitConfig {
             invoice_status_per_source_per_min: default_invoice_status_per_source_per_min(),
             invoice_create_per_source_per_min: default_invoice_create_per_source_per_min(),
             invoice_create_per_npub_per_hour: default_invoice_create_per_npub_per_hour(),
+            pos_invoice_create_per_terminal_per_5min:
+                default_pos_invoice_create_per_terminal_per_5min(),
+            pos_pairing_create_per_source_per_hour: default_pos_pairing_create_per_source_per_hour(
+            ),
+            pos_pairing_claim_failures_per_source_per_hour:
+                default_pos_pairing_claim_failures_per_source_per_hour(),
+            pos_pairing_poll_per_source_per_5min: default_pos_pairing_poll_per_source_per_5min(),
         }
     }
 }
@@ -985,6 +1005,18 @@ fn default_invoice_create_per_source_per_min() -> u32 {
 /// stolen mobile credential without throttling legitimate use.
 fn default_invoice_create_per_npub_per_hour() -> u32 {
     100
+}
+fn default_pos_invoice_create_per_terminal_per_5min() -> u32 {
+    30
+}
+fn default_pos_pairing_create_per_source_per_hour() -> u32 {
+    5
+}
+fn default_pos_pairing_claim_failures_per_source_per_hour() -> u32 {
+    20
+}
+fn default_pos_pairing_poll_per_source_per_5min() -> u32 {
+    120
 }
 
 // --- Electrum / tx cache config ---

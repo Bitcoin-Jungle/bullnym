@@ -68,6 +68,42 @@ pub struct PwaShells {
     pub pos: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    Donation,
+    Pos,
+}
+
+impl ShellKind {
+    fn mode(self) -> &'static str {
+        match self {
+            Self::Donation => "donation",
+            Self::Pos => "pos",
+        }
+    }
+
+    fn csp(self) -> &'static str {
+        match self {
+            Self::Donation => DONATION_CSP,
+            Self::Pos => POS_CSP,
+        }
+    }
+
+    fn manifest_href(self, nym: &str) -> String {
+        match self {
+            Self::Donation => format!("/{nym}/manifest.webmanifest"),
+            Self::Pos => format!("/{nym}/pos/manifest.webmanifest"),
+        }
+    }
+
+    fn start_url(self, nym: &str) -> String {
+        match self {
+            Self::Donation => format!("/{nym}"),
+            Self::Pos => format!("/{nym}/pos"),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct PwaConfigView<'a> {
     nym: &'a str,
@@ -87,7 +123,7 @@ struct PwaConfigView<'a> {
 
 #[derive(Serialize)]
 struct WebManifest<'a> {
-    name: &'a str,
+    name: String,
     short_name: String,
     start_url: String,
     scope: &'static str,
@@ -127,11 +163,10 @@ impl PwaShells {
         }
     }
 
-    async fn shell_for(&self, pos_mode: bool) -> Option<String> {
-        let path = if pos_mode {
-            self.pos.as_ref()
-        } else {
-            self.donation.as_ref()
+    async fn shell_for(&self, kind: ShellKind) -> Option<String> {
+        let path = match kind {
+            ShellKind::Donation => self.donation.as_ref(),
+            ShellKind::Pos => self.pos.as_ref(),
         }?;
 
         match tokio::fs::read_to_string(path).await {
@@ -189,7 +224,7 @@ const PWA_SHELL_HEADER: &str = "x-bullnym-pwa-shell";
 
 /// Add a few defensive response headers that apply to all donation-page
 /// HTML responses.
-fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
+fn apply_security_headers(resp: &mut Response, kind: ShellKind) {
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
@@ -217,7 +252,7 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
     //   script-src pinned; only connect-src changes for live POS pages.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(if pos_mode { POS_CSP } else { DONATION_CSP }),
+        HeaderValue::from_static(kind.csp()),
     );
     // 60s freshness gives a CDN/browser cache the chance to absorb a
     // viral-link burst, while keeping mutations (e.g. archive) visible
@@ -228,10 +263,9 @@ fn apply_security_headers(resp: &mut Response, pos_mode: bool) {
     );
 }
 
-fn mark_pwa_shell_response(resp: &mut Response, pos_mode: bool) {
-    let value = if pos_mode { "pos" } else { "donation" };
+fn mark_pwa_shell_response(resp: &mut Response, kind: ShellKind) {
     resp.headers_mut()
-        .insert(PWA_SHELL_HEADER, HeaderValue::from_static(value));
+        .insert(PWA_SHELL_HEADER, HeaderValue::from_static(kind.mode()));
 }
 
 fn render_404(state: &AppState, nym: &str) -> Response {
@@ -242,7 +276,7 @@ fn render_404(state: &AppState, nym: &str) -> Response {
     .render()
     .unwrap_or_else(|_| "Not found".to_string());
     let mut resp = (StatusCode::NOT_FOUND, body).into_response();
-    apply_security_headers(&mut resp, false);
+    apply_security_headers(&mut resp, ShellKind::Donation);
     resp
 }
 
@@ -254,7 +288,7 @@ fn render_archived(state: &AppState, nym: &str) -> Response {
     .render()
     .unwrap_or_else(|_| "Archived".to_string());
     let mut resp = (StatusCode::OK, body).into_response();
-    apply_security_headers(&mut resp, false);
+    apply_security_headers(&mut resp, ShellKind::Donation);
     resp
 }
 
@@ -281,16 +315,21 @@ fn short_manifest_name(name: &str) -> String {
     name.chars().take(12).collect()
 }
 
-fn web_manifest_for_page(page: &db::DonationPage) -> WebManifest<'_> {
+fn web_manifest_for_page(page: &db::DonationPage, kind: ShellKind) -> WebManifest<'_> {
     let name = if page.header.trim().is_empty() {
         page.nym.as_str()
     } else {
         page.header.as_str()
     };
+    let manifest_name = match kind {
+        ShellKind::Donation => name.to_string(),
+        ShellKind::Pos => format!("{name} POS"),
+    };
+    let short_name = short_manifest_name(&manifest_name);
     WebManifest {
-        name,
-        short_name: short_manifest_name(name),
-        start_url: format!("/{}", page.nym),
+        name: manifest_name,
+        short_name,
+        start_url: kind.start_url(&page.nym),
         scope: "/",
         display: "standalone",
         background_color: "#161512",
@@ -344,6 +383,7 @@ fn og_meta_tags(header: &str, description: &str, og_url: Option<&str>) -> String
 fn inject_pwa_shell(
     shell: &str,
     config: &PwaConfigView<'_>,
+    kind: ShellKind,
     og_url: Option<&str>,
 ) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string(config)?;
@@ -351,8 +391,8 @@ fn inject_pwa_shell(
     let config_script =
         format!(r#"<script id="bullnym-config" type="application/json">{json}</script>"#);
     let manifest_link = format!(
-        r#"<link rel="manifest" href="/{}/manifest.webmanifest">"#,
-        html_escape_attr(config.nym)
+        r#"<link rel="manifest" href="{}">"#,
+        html_escape_attr(&kind.manifest_href(config.nym))
     );
     Ok(shell
         .replace("<!-- BULLNYM_CONFIG -->", &config_script)
@@ -429,6 +469,25 @@ pub async fn manifest(
     peer_opt: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    manifest_for_kind(state, nym, peer_opt, headers, ShellKind::Donation).await
+}
+
+pub async fn pos_manifest(
+    State(state): State<AppState>,
+    AxumPath(nym): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    manifest_for_kind(state, nym, peer_opt, headers, ShellKind::Pos).await
+}
+
+async fn manifest_for_kind(
+    state: AppState,
+    nym: String,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    kind: ShellKind,
+) -> Response {
     if !is_valid_slug(&nym) || reserved_nyms::is_reserved(&nym) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -440,7 +499,11 @@ pub async fn manifest(
     }
 
     let page = match db::get_donation_page_by_nym(&state.db, &nym).await {
-        Ok(Some(p)) if p.enabled && !p.is_archived => p,
+        Ok(Some(p)) if !p.is_archived && (kind == ShellKind::Pos || p.enabled) => p,
+        Ok(None) if kind == ShellKind::Pos => match pos_placeholder_page(&state, &nym).await {
+            Some(p) => p,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(event = "manifest_db_error", nym = %nym, error = %e);
@@ -448,7 +511,7 @@ pub async fn manifest(
         }
     };
 
-    let manifest = web_manifest_for_page(&page);
+    let manifest = web_manifest_for_page(&page, kind);
 
     let body = match serde_json::to_string(&manifest) {
         Ok(body) => body,
@@ -471,7 +534,7 @@ pub async fn manifest(
     resp
 }
 
-async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
+async fn render_live(state: &AppState, page: &db::DonationPage, kind: ShellKind) -> Response {
     let domain = &state.config.domain;
     let public_url = format!("https://{domain}/{}", page.nym);
 
@@ -496,12 +559,11 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
 
     let supported_currencies = state.pricer.supported_currencies().to_vec();
 
-    if let Some(shell) = state.pwa_shells.shell_for(page.pos_mode).await {
+    if let Some(shell) = state.pwa_shells.shell_for(kind).await {
         let avatar_url_ref = avatar_url.as_deref();
-        let mode = if page.pos_mode { "pos" } else { "donation" };
         let config = PwaConfigView {
             nym: &page.nym,
-            mode,
+            mode: kind.mode(),
             currency: &page.display_currency,
             header: &page.header,
             description: &page.description,
@@ -514,11 +576,11 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
             liquid_btc_asset_id: crate::invoice::LIQUID_BTC_ASSET_ID,
             domain,
         };
-        let body = inject_pwa_shell(&shell, &config, og_url.as_deref())
+        let body = inject_pwa_shell(&shell, &config, kind, og_url.as_deref())
             .unwrap_or_else(|e| format!("template render failed: {e}"));
         let mut resp = (StatusCode::OK, body).into_response();
-        apply_security_headers(&mut resp, page.pos_mode);
-        mark_pwa_shell_response(&mut resp, page.pos_mode);
+        apply_security_headers(&mut resp, kind);
+        mark_pwa_shell_response(&mut resp, kind);
         return resp;
     }
 
@@ -541,7 +603,7 @@ async fn render_live(state: &AppState, page: &db::DonationPage) -> Response {
     .unwrap_or_else(|e| format!("template render failed: {e}"));
 
     let mut resp = (StatusCode::OK, body).into_response();
-    apply_security_headers(&mut resp, page.pos_mode);
+    apply_security_headers(&mut resp, ShellKind::Donation);
     resp
 }
 
@@ -601,7 +663,70 @@ pub async fn render_or_404(
         return render_404(&state, nym);
     }
 
-    render_live(&state, &page).await
+    render_live(&state, &page, ShellKind::Donation).await
+}
+
+pub async fn render_pos_or_404(
+    State(state): State<AppState>,
+    AxumPath(nym): AxumPath<String>,
+    peer_opt: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_valid_slug(&nym) || reserved_nyms::is_reserved(&nym) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Err(resp) =
+        check_donation_rate_limit(&state, peer_opt, &headers, DonationRateBucket::Html).await
+    {
+        return resp;
+    }
+
+    let page = match db::get_donation_page_by_nym(&state.db, &nym).await {
+        Ok(Some(p)) if !p.is_archived => p,
+        Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => match pos_placeholder_page(&state, &nym).await {
+            Some(p) => p,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
+        Err(e) => {
+            tracing::error!(event = "pos_render_db_error", nym = %nym, error = %e);
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    render_live(&state, &page, ShellKind::Pos).await
+}
+
+/// POS is nym-gated, not page-gated: a merchant must be able to open the
+/// terminal shell (and create a pairing) before any donation page exists.
+/// Serve the shell for an active nym by synthesizing the same disabled
+/// placeholder the `pos-pair` claim later materializes in the database.
+async fn pos_placeholder_page(state: &AppState, nym: &str) -> Option<db::DonationPage> {
+    match db::get_active_user_by_nym(&state.db, nym).await {
+        Ok(Some(user)) => Some(db::DonationPage {
+            header: user.nym.clone(),
+            nym: user.nym,
+            ct_descriptor: None,
+            next_addr_idx: 0,
+            pos_ct_descriptor: None,
+            pos_next_addr_idx: 0,
+            description: String::new(),
+            avatar_sha256: None,
+            og_sha256: None,
+            display_currency: "USD".to_string(),
+            website: None,
+            twitter: None,
+            instagram: None,
+            enabled: false,
+            is_archived: false,
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(event = "pos_placeholder_db_error", nym = %nym, error = %e);
+            None
+        }
+    }
 }
 
 #[cfg(test)]

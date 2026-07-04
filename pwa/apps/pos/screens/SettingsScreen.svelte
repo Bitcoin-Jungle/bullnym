@@ -2,14 +2,18 @@
   // Reskinned to nostr-pos's Settings.svelte
   // (~/apps/nostr-pos/apps/pos-pwa/src/routes/Settings.svelte) look (dl
   // card, Button component) while keeping our full functionality: PIN
-  // gate, currency override, paper size, Bolt Card toggle, clear
-  // history/reset terminal — none of which exist upstream (no PIN concept,
-  // no multi-currency, no Bolt Card toggle, no paper size).
+  // gate, currency override, paper size, Bolt Card toggle, unpair/reset
+  // terminal — none of which exist upstream (no PIN concept, no
+  // multi-currency, no Bolt Card toggle, no paper size, no terminal
+  // pairing). "Unpair terminal" clears only the bullnym:terminal:<nym> key
+  // (PIN/settings survive) and returns to the pairing gate; "Reset
+  // terminal" wipes every bullnym:-prefixed key (which includes the
+  // terminal key, so it also unpairs) and reloads.
   import { config } from '$lib/config'
   import { getSupportedCurrencies, type CurrencyView } from '$lib/api/client'
   import { rate } from '$lib/stores/rate.svelte'
   import { settings, type PaperSize } from '$lib/stores/settings.svelte'
-  import { history } from '$lib/stores/history.svelte'
+  import { terminal } from '$lib/stores/terminal.svelte'
   import { router } from '$lib/router.svelte'
   import { hasPin, setPin, verifyPin, lockoutRemainingMs, recordFailedAttempt, clearAttempts } from '$lib/pin'
   import Keypad from '$lib/components/Keypad.svelte'
@@ -152,14 +156,15 @@
     settings.paperSize = size
   }
 
-  let clearHistoryConfirm = $state(false)
-  function onClearHistory() {
-    if (!clearHistoryConfirm) {
-      clearHistoryConfirm = true
+  let unpairConfirm = $state(false)
+  function onUnpairTerminal() {
+    if (!unpairConfirm) {
+      unpairConfirm = true
       return
     }
-    history.clear()
-    clearHistoryConfirm = false
+    terminal.unpair()
+    unpairConfirm = false
+    router.go('/')
   }
 
   let resetConfirm = $state(false)
@@ -168,6 +173,11 @@
       resetConfirm = true
       return
     }
+    // Unpairing first (not just relying on the bullnym:-prefix wipe below)
+    // stops the polling interval etc. cleanly, in case a pairing attempt is
+    // in flight — the full reload right after makes it belt-and-suspenders,
+    // not load-bearing.
+    terminal.unpair()
     try {
       const keys: string[] = []
       for (let i = 0; i < localStorage.length; i++) {
@@ -268,6 +278,10 @@
             <dd class="font-bold">{config.mode}</dd>
           </div>
           <div class="flex items-center justify-between gap-5">
+            <dt class="text-[#776b5a] dark:text-[#b9aa91]">Terminal</dt>
+            <dd class="font-bold">{terminal.label || terminal.terminalId?.slice(0, 8) || '—'}</dd>
+          </div>
+          <div class="flex items-center justify-between gap-5">
             <dt class="text-[#776b5a] dark:text-[#b9aa91]">App version</dt>
             <dd class="font-bold">{__APP_VERSION__}</dd>
           </div>
@@ -316,8 +330,8 @@
       </div>
 
       <div class="mt-5">
-        <Button variant="danger" onclick={onClearHistory}>
-          {clearHistoryConfirm ? 'Tap again to confirm' : 'Clear history'}
+        <Button variant="danger" onclick={onUnpairTerminal}>
+          {unpairConfirm ? 'Tap again to confirm' : 'Unpair terminal'}
         </Button>
       </div>
 

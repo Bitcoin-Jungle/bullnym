@@ -45,7 +45,7 @@ fn slug_rejects_underscores_and_special() {
 fn security_headers_keep_donation_csp_tight() {
     let mut resp = StatusCode::OK.into_response();
 
-    apply_security_headers(&mut resp, false);
+    apply_security_headers(&mut resp, ShellKind::Donation);
 
     let csp = resp
         .headers()
@@ -63,7 +63,7 @@ fn security_headers_keep_donation_csp_tight() {
 fn security_headers_allow_https_connects_for_pos_csp() {
     let mut resp = StatusCode::OK.into_response();
 
-    apply_security_headers(&mut resp, true);
+    apply_security_headers(&mut resp, ShellKind::Pos);
 
     let csp = resp
         .headers()
@@ -117,6 +117,8 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         nym: "manifestnym".to_string(),
         ct_descriptor: None,
         next_addr_idx: 0,
+        pos_ct_descriptor: None,
+        pos_next_addr_idx: 0,
         header: "   ".to_string(),
         description: "Description".to_string(),
         avatar_sha256: None,
@@ -125,12 +127,11 @@ fn web_manifest_falls_back_to_nym_and_truncates_short_name() {
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: false,
         enabled: true,
         is_archived: false,
     };
 
-    let manifest = web_manifest_for_page(&page);
+    let manifest = web_manifest_for_page(&page, ShellKind::Donation);
 
     assert_eq!(manifest.name, "manifestnym");
     assert_eq!(manifest.short_name, "manifestnym");
@@ -150,6 +151,8 @@ fn web_manifest_uses_header_for_name() {
         nym: "alice".to_string(),
         ct_descriptor: None,
         next_addr_idx: 0,
+        pos_ct_descriptor: None,
+        pos_next_addr_idx: 0,
         header: "Alice Coffee Counter".to_string(),
         description: "Description".to_string(),
         avatar_sha256: None,
@@ -158,16 +161,42 @@ fn web_manifest_uses_header_for_name() {
         website: None,
         twitter: None,
         instagram: None,
-        pos_mode: true,
         enabled: true,
         is_archived: false,
     };
 
-    let manifest = web_manifest_for_page(&page);
+    let manifest = web_manifest_for_page(&page, ShellKind::Donation);
 
     assert_eq!(manifest.name, "Alice Coffee Counter");
     assert_eq!(manifest.short_name, "Alice Coffee");
     assert_eq!(manifest.start_url, "/alice");
+}
+
+#[test]
+fn pos_web_manifest_appends_pos_and_uses_pos_start_url() {
+    let page = db::DonationPage {
+        nym: "alice".to_string(),
+        ct_descriptor: None,
+        next_addr_idx: 0,
+        pos_ct_descriptor: None,
+        pos_next_addr_idx: 0,
+        header: "Alice Coffee Counter".to_string(),
+        description: "Description".to_string(),
+        avatar_sha256: None,
+        og_sha256: None,
+        display_currency: "USD".to_string(),
+        website: None,
+        twitter: None,
+        instagram: None,
+        enabled: false,
+        is_archived: false,
+    };
+
+    let manifest = web_manifest_for_page(&page, ShellKind::Pos);
+
+    assert_eq!(manifest.name, "Alice Coffee Counter POS");
+    assert_eq!(manifest.short_name, "Alice Coffee");
+    assert_eq!(manifest.start_url, "/alice/pos");
 }
 
 #[test]
@@ -192,6 +221,7 @@ fn pwa_shell_injects_config_and_og_placeholders() {
     let html = inject_pwa_shell(
         shell,
         &config,
+        ShellKind::Pos,
         Some("https://bullpay.ca/img/alice/og.jpg?v=a&b"),
     )
     .expect("injects shell");
@@ -202,7 +232,7 @@ fn pwa_shell_injects_config_and_og_placeholders() {
         config_json["liquid_btc_asset_id"],
         "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
     );
-    assert!(html.contains(r#"<link rel="manifest" href="/alice/manifest.webmanifest">"#));
+    assert!(html.contains(r#"<link rel="manifest" href="/alice/pos/manifest.webmanifest">"#));
     assert!(html.contains(r#""mode":"pos""#));
     assert!(html.contains(r#""avatar_url":"https://bullpay.ca/img/alice/avatar.webp""#));
     assert!(html.contains(r#"<meta property="og:title" content="Alice &amp; Sons">"#));
@@ -234,7 +264,7 @@ fn pwa_shell_escapes_manifest_nym_attr() {
         domain: "bullpay.ca",
     };
 
-    let html = inject_pwa_shell(shell, &config, None).expect("injects shell");
+    let html = inject_pwa_shell(shell, &config, ShellKind::Donation, None).expect("injects shell");
 
     assert!(html.contains(r#"<link rel="manifest" href="/bad&quot;name/manifest.webmanifest">"#));
 }
@@ -258,7 +288,7 @@ fn pwa_shell_escapes_script_breakout_in_json() {
         domain: "bullpay.ca",
     };
 
-    let html = inject_pwa_shell(shell, &config, None).expect("injects shell");
+    let html = inject_pwa_shell(shell, &config, ShellKind::Donation, None).expect("injects shell");
 
     assert!(html.contains(r#"\u003c/script>"#));
     assert!(!html.contains("</script><script>"));
@@ -281,14 +311,14 @@ async fn pwa_shell_reads_current_file_from_disk() {
     let shells = PwaShells::load(&root);
 
     assert_eq!(
-        shells.shell_for(false).await.as_deref(),
+        shells.shell_for(ShellKind::Donation).await.as_deref(),
         Some("first shell")
     );
 
     std::fs::write(&donation_path, "rebuilt shell").expect("write rebuilt shell");
 
     assert_eq!(
-        shells.shell_for(false).await.as_deref(),
+        shells.shell_for(ShellKind::Donation).await.as_deref(),
         Some("rebuilt shell")
     );
 
@@ -299,17 +329,17 @@ async fn pwa_shell_reads_current_file_from_disk() {
 async fn pwa_shell_missing_file_falls_back_to_askama_path() {
     let shells = PwaShells::default();
 
-    assert!(shells.shell_for(false).await.is_none());
+    assert!(shells.shell_for(ShellKind::Donation).await.is_none());
 }
 
 #[test]
 fn pwa_shell_header_marks_donation_shells_only_when_requested() {
     let mut resp = StatusCode::OK.into_response();
 
-    apply_security_headers(&mut resp, false);
+    apply_security_headers(&mut resp, ShellKind::Donation);
     assert!(!resp.headers().contains_key(PWA_SHELL_HEADER));
 
-    mark_pwa_shell_response(&mut resp, false);
+    mark_pwa_shell_response(&mut resp, ShellKind::Donation);
 
     assert_eq!(
         resp.headers()
@@ -325,7 +355,7 @@ fn pwa_shell_header_marks_donation_shells_only_when_requested() {
 fn pwa_shell_header_marks_pos_shells() {
     let mut resp = StatusCode::OK.into_response();
 
-    mark_pwa_shell_response(&mut resp, true);
+    mark_pwa_shell_response(&mut resp, ShellKind::Pos);
 
     assert_eq!(
         resp.headers()

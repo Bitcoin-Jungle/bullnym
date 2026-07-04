@@ -20,8 +20,8 @@ use tower_http::trace::TraceLayer;
 
 use pay_service::{
     bitcoin_watcher, boltz, certification, chain_watcher, claimer, config, db, donation_page,
-    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pricer, qr, rate_limit, readiness,
-    reconciler, registration,
+    donation_render, gc, invoice, ip_whitelist, lnurl, nostr, pos, pricer, qr, rate_limit,
+    readiness, reconciler, registration,
     utxo::{self, UtxoBackend},
     version, AppState,
 };
@@ -390,6 +390,11 @@ fn build_router(state: AppState) -> Router {
             )
             .route("/donation-page/:nym", get(donation_page::get))
             .route("/:nym/manifest.webmanifest", get(donation_render::manifest))
+            .route("/:nym/pos", get(donation_render::render_pos_or_404))
+            .route(
+                "/:nym/pos/manifest.webmanifest",
+                get(donation_render::pos_manifest),
+            )
             // Donation checkout now uses invoice sessions instead of the
             // removed donation callback/status endpoints.
             // Anonymous checkout invoice endpoints. The create route keeps a
@@ -397,6 +402,29 @@ fn build_router(state: AppState) -> Router {
             .route(
                 "/:nym/invoice",
                 post(invoice::create_anonymous).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route(
+                "/:nym/pos/pairings",
+                post(pos::create_pairing).layer(DefaultBodyLimit::max(512)),
+            )
+            .route("/:nym/pos/pairings/:id", get(pos::poll_pairing))
+            .route(
+                "/:nym/pos/invoice",
+                post(pos::create_invoice).layer(DefaultBodyLimit::max(2048)),
+            )
+            .route("/:nym/pos/invoices", get(pos::list_invoices))
+            .route(
+                "/:nym/pos/invoices/:id/cancel",
+                post(pos::cancel_invoice).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route(
+                "/api/v1/pos/pairings/claim",
+                post(pos::claim_pairing).layer(DefaultBodyLimit::max(1024)),
+            )
+            .route("/api/v1/pos/terminals", get(pos::list_terminals))
+            .route(
+                "/api/v1/pos/terminals/:id/revoke",
+                post(pos::revoke_terminal).layer(DefaultBodyLimit::max(1024)),
             )
             .route("/:nym/i/:id", get(invoice::render_payment));
 

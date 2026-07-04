@@ -27,6 +27,7 @@ pub struct GcConfig {
     pub tick_secs: u64,
     pub retention_secs: u64,
     pub checkout_partial_terminal_grace_secs: u64,
+    pub pos_pairing_purge_grace_secs: u64,
     /// TTL for unfulfilled `outpoint_addresses` rows. Rows that the chain
     /// watcher hasn't observed paid within this window are recycled. 1h is
     /// enough for any real payer to land their tx; longer just lets
@@ -40,6 +41,7 @@ impl Default for GcConfig {
             tick_secs: 600,         // 10 min
             retention_secs: 86_400, // 24 h — well past the longest 1h window
             checkout_partial_terminal_grace_secs: 900,
+            pos_pairing_purge_grace_secs: 900,
             outpoint_pending_ttl_secs: 3_600, // 1 h
         }
     }
@@ -62,6 +64,8 @@ pub async fn run(pool: PgPool, cancel: CancellationToken, cfg: GcConfig) {
                 let removed_oa =
                     prune_outpoint_addresses(&pool, cfg.outpoint_pending_ttl_secs).await;
                 let removed_iv = expire_invoices_past_deadline(&pool).await;
+                let removed_pt =
+                    purge_expired_unclaimed_terminals(&pool, cfg.pos_pairing_purge_grace_secs).await;
                 let terminalized_partials =
                     terminalize_stale_checkout_partial_invoices(
                         &pool,
@@ -69,11 +73,13 @@ pub async fn run(pool: PgPool, cancel: CancellationToken, cfg: GcConfig) {
                     ).await;
                 tracing::info!(
                     "rate-limit GC: pruned rate_limit_events={} nym_access_events={} \
-                     outpoint_addresses_pending={} invoices_expired={} checkout_partials_underpaid={}",
+                     outpoint_addresses_pending={} invoices_expired={} pos_pairings_expired={} \
+                     checkout_partials_underpaid={}",
                     removed_rl,
                     removed_na,
                     removed_oa,
                     removed_iv,
+                    removed_pt,
                     terminalized_partials,
                 );
             }
@@ -132,6 +138,16 @@ async fn terminalize_stale_checkout_partial_invoices(pool: &PgPool, grace_secs: 
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("rate-limit GC: terminalize stale checkout partials failed: {e}");
+            0
+        }
+    }
+}
+
+async fn purge_expired_unclaimed_terminals(pool: &PgPool, grace_secs: u64) -> u64 {
+    match db::purge_expired_unclaimed_terminals(pool, grace_secs).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("rate-limit GC: purge expired POS pairings failed: {e}");
             0
         }
     }

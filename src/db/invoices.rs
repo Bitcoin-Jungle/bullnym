@@ -31,6 +31,8 @@ pub struct Invoice {
     pub amount_sat: i64,
     pub rate_minor_per_btc: Option<i64>,
     pub memo: Option<String>,
+    pub terminal_id: Option<Uuid>,
+    pub memo_public: bool,
     pub recipient_label: Option<String>,
     pub bitcoin_address: Option<String>,
     pub accept_btc: bool,
@@ -60,9 +62,9 @@ pub struct Invoice {
 /// so a new column added to the struct is reflected in exactly one place
 /// (mirrors the SwapRecord pattern). FromRow matches by alias name, so
 /// the order is cosmetic.
-const INVOICE_COLUMNS: &str =
+pub(crate) const INVOICE_COLUMNS_FOR_INTERNAL_QUERY: &str =
     "id, nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
-     rate_minor_per_btc, memo, recipient_label, \
+     rate_minor_per_btc, memo, terminal_id, memo_public, recipient_label, \
      bitcoin_address, accept_btc, accept_ln, accept_liquid, \
      public_description, invoice_number, \
      liquid_address, liquid_address_index, status, paid_via, paid_amount_sat, \
@@ -91,6 +93,8 @@ pub struct NewInvoice<'a> {
     /// naturally never fires.
     pub rate_lock_secs: i64,
     pub memo: Option<&'a str>,
+    pub terminal_id: Option<Uuid>,
+    pub memo_public: bool,
     pub recipient_label: Option<&'a str>,
     pub public_description: Option<&'a str>,
     pub invoice_number: Option<&'a str>,
@@ -136,17 +140,17 @@ pub async fn insert_invoice(
     let inserted = sqlx::query_as::<_, Invoice>(&format!(
         "INSERT INTO invoices \
             (nym_owner, npub_owner, origin, fiat_amount_minor, fiat_currency, amount_sat, \
-             rate_minor_per_btc, rate_locks_until, memo, recipient_label, \
+             rate_minor_per_btc, rate_locks_until, memo, terminal_id, memo_public, recipient_label, \
              public_description, invoice_number, \
              accept_btc, accept_ln, accept_liquid, \
              bitcoin_address, liquid_address, pricing_mode, liquid_blinding_key_hex, \
              expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, \
-                 NOW() + ($8 || ' seconds')::interval, $9, $10, \
-                 $11, $12, $13, $14, $15, $16, $17, \
-                 CASE WHEN $7::BIGINT IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $18, \
-                 NOW() + ($19 || ' seconds')::interval) \
-         RETURNING {INVOICE_COLUMNS}"
+                 NOW() + ($8 || ' seconds')::interval, $9, $10, $11, $12, \
+                 $13, $14, $15, $16, $17, $18, $19, \
+                 CASE WHEN $7::BIGINT IS NULL THEN 'sat_fixed' ELSE 'fiat_fixed' END, $20, \
+                 NOW() + ($21 || ' seconds')::interval) \
+         RETURNING {INVOICE_COLUMNS_FOR_INTERNAL_QUERY}"
     ))
     .bind(invoice.nym_owner)
     .bind(invoice.npub_owner)
@@ -157,6 +161,8 @@ pub async fn insert_invoice(
     .bind(invoice.rate_minor_per_btc)
     .bind(invoice.rate_lock_secs)
     .bind(invoice.memo)
+    .bind(invoice.terminal_id)
+    .bind(invoice.memo_public)
     .bind(invoice.recipient_label)
     .bind(invoice.public_description)
     .bind(invoice.invoice_number)
@@ -198,7 +204,7 @@ pub async fn insert_invoice(
 
 pub async fn get_invoice_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Invoice>, sqlx::Error> {
     sqlx::query_as::<_, Invoice>(&format!(
-        "SELECT {INVOICE_COLUMNS} FROM invoices WHERE id = $1"
+        "SELECT {INVOICE_COLUMNS_FOR_INTERNAL_QUERY} FROM invoices WHERE id = $1"
     ))
     .bind(id)
     .fetch_optional(pool)
@@ -241,13 +247,42 @@ pub async fn list_invoices_by_npub(
 ) -> Result<Vec<Invoice>, sqlx::Error> {
     let offset = (page.saturating_sub(1)).saturating_mul(page_size);
     sqlx::query_as::<_, Invoice>(&format!(
-        "SELECT {INVOICE_COLUMNS} FROM invoices \
+        "SELECT {INVOICE_COLUMNS_FOR_INTERNAL_QUERY} FROM invoices \
          WHERE npub_owner = $1 \
            AND ($2::TEXT IS NULL OR status = $2) \
          ORDER BY created_at DESC \
          LIMIT $3 OFFSET $4"
     ))
     .bind(npub_owner)
+    .bind(status_filter)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+/// List terminal-attributed invoices for a payment-page nym, newest-first.
+///
+/// The terminal API is nym-scoped rather than npub-scoped: any active
+/// terminal for the nym can see the shared register history. Caller clamps
+/// paging and validates status strings.
+pub async fn list_pos_invoices_by_nym(
+    pool: &PgPool,
+    nym_owner: &str,
+    status_filter: Option<&str>,
+    page: i64,
+    page_size: i64,
+) -> Result<Vec<Invoice>, sqlx::Error> {
+    let offset = (page.saturating_sub(1)).saturating_mul(page_size);
+    sqlx::query_as::<_, Invoice>(&format!(
+        "SELECT {INVOICE_COLUMNS_FOR_INTERNAL_QUERY} FROM invoices \
+         WHERE nym_owner = $1 \
+           AND terminal_id IS NOT NULL \
+           AND ($2::TEXT IS NULL OR status = $2) \
+         ORDER BY created_at DESC \
+         LIMIT $3 OFFSET $4"
+    ))
+    .bind(nym_owner)
     .bind(status_filter)
     .bind(page_size)
     .bind(offset)
@@ -594,7 +629,7 @@ pub async fn record_invoice_payment(
 
     let mut tx = pool.begin().await?;
     let inv = sqlx::query_as::<_, Invoice>(&format!(
-        "SELECT {INVOICE_COLUMNS} FROM invoices WHERE id = $1 FOR UPDATE"
+        "SELECT {INVOICE_COLUMNS_FOR_INTERNAL_QUERY} FROM invoices WHERE id = $1 FOR UPDATE"
     ))
     .bind(id)
     .fetch_one(&mut *tx)

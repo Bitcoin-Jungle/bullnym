@@ -1,5 +1,6 @@
-// Typed client for the bullnym anonymous checkout endpoints. Shapes
-// mirror src/invoice.rs exactly — do not "improve" field names here.
+// Typed client for the bullnym anonymous checkout endpoints, plus the POS
+// terminal pairing/invoice endpoints (src/pos.rs). Shapes mirror the Rust
+// handlers exactly — do not "improve" field names here.
 
 export class ApiError extends Error {
   constructor(
@@ -41,6 +42,8 @@ export interface InvoiceStatus {
     | 'expired'
     | 'cancelled'
     | string
+  /** Populated only for POS-created invoices (memo_public), in every lifecycle state. */
+  memo: string | null
   pricing_mode: string
   settlement_status: string
   amount_sat: number
@@ -157,4 +160,148 @@ export function getSupportedCurrencies(): Promise<SupportedCurrenciesResponse> {
  */
 export function fetchLightningOffer(id: string): Promise<{ pr: string }> {
   return request(`/api/v1/invoices/${id}/lightning`, { method: 'POST' })
+}
+
+// ---------------------------------------------------------------------------
+// POS terminal endpoints (src/pos.rs). Pairing is anonymous (proven by
+// token_hash, not a bearer token); create/list/cancel require the bearer
+// terminal token.
+// ---------------------------------------------------------------------------
+
+/** Response of POST /:nym/pos/pairings (pos.rs CreatePairingResponse). */
+export interface CreatePairingResponse {
+  pairing_id: string
+  code: string
+  expires_at_unix: number
+}
+
+export function createPairing(nym: string, tokenHash: string): Promise<CreatePairingResponse> {
+  return request(`/${nym}/pos/pairings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token_hash: tokenHash }),
+  })
+}
+
+/** Response of GET /:nym/pos/pairings/:id (pos.rs PollPairingResponse). */
+export interface PollPairingResponse {
+  status: 'pending' | 'approved' | 'expired' | string
+  terminal_id?: string
+}
+
+export function pollPairing(nym: string, pairingId: string, tokenHash: string): Promise<PollPairingResponse> {
+  return request(`/${nym}/pos/pairings/${pairingId}?token_hash=${encodeURIComponent(tokenHash)}`)
+}
+
+/**
+ * Called whenever a terminal-authed request (bearer token) comes back 401 —
+ * the token was never valid, expired, or the wallet revoked it server-side.
+ * client.ts deliberately does NOT import the terminal store or router here
+ * (that would be a circular import: the store imports this module for
+ * createPairing/pollPairing) — the POS app registers a handler at boot
+ * instead (apps/pos/App.svelte), which clears pairing state and lets the
+ * pairing gate take over.
+ */
+type UnauthorizedHandler = () => void
+let onUnauthorized: UnauthorizedHandler | null = null
+
+export function registerUnauthorizedHandler(handler: UnauthorizedHandler): void {
+  onUnauthorized = handler
+}
+
+async function terminalRequest<T>(token: string, url: string, init?: RequestInit): Promise<T> {
+  try {
+    return await request<T>(url, {
+      ...init,
+      headers: { ...(init?.headers ?? {}), Authorization: `Bearer ${token}` },
+    })
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) onUnauthorized?.()
+    throw err
+  }
+}
+
+export interface CreateTerminalInvoiceRequest {
+  amount_sat?: number
+  fiat_amount_minor?: number
+  fiat_currency?: string
+  /** <=280 chars, no control characters (validated client-side; server re-validates). */
+  memo?: string
+}
+
+/** POST /:nym/pos/invoice — same response shape as the anonymous create. */
+export function createTerminalInvoice(
+  nym: string,
+  token: string,
+  req: CreateTerminalInvoiceRequest,
+): Promise<CreateInvoiceResponse> {
+  return terminalRequest(token, `/${nym}/pos/invoice`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+}
+
+/** Item shape of GET /:nym/pos/invoices (pos.rs PosInvoiceListItem). */
+export interface PosInvoiceListItem {
+  id: string
+  status: string
+  pricing_mode: string
+  settlement_status: string
+  amount_sat: number
+  remaining_amount_sat: number
+  fiat_amount_minor: number | null
+  fiat_currency: string | null
+  memo: string | null
+  terminal_id: string | null
+  accept_btc: boolean
+  accept_ln: boolean
+  accept_liquid: boolean
+  bitcoin_address: string | null
+  liquid_address: string | null
+  created_at_unix: number
+  expires_at_unix: number
+  paid_via: string | null
+  paid_at_unix: number | null
+  paid_amount_sat: number | null
+}
+
+/** Response of GET /:nym/pos/invoices (pos.rs ListInvoicesResponse). */
+export interface ListInvoicesResponse {
+  invoices: PosInvoiceListItem[]
+  page: number
+  pageSize: number
+  has_more: boolean
+}
+
+export interface ListTerminalInvoicesParams {
+  page: number
+  pageSize: number
+  status?: string
+}
+
+export function listTerminalInvoices(
+  nym: string,
+  token: string,
+  params: ListTerminalInvoicesParams,
+): Promise<ListInvoicesResponse> {
+  const qs = new URLSearchParams({ page: String(params.page), pageSize: String(params.pageSize) })
+  if (params.status) qs.set('status', params.status)
+  return terminalRequest(token, `/${nym}/pos/invoices?${qs.toString()}`)
+}
+
+/** Response of POST /:nym/pos/invoices/:id/cancel (pos.rs CancelInvoiceResponse). */
+export interface CancelTerminalInvoiceResponse {
+  invoice_id: string
+  status: string
+}
+
+/**
+ * Cancels an unpaid terminal-attributed invoice. Rejects with
+ * ApiError.code === 'InvoicePaymentAlreadyDetected' when payment was already
+ * detected server-side (in_progress/partially_paid/paid/underpaid/overpaid) —
+ * callers must surface that case distinctly rather than as a generic error.
+ */
+export function cancelTerminalInvoice(nym: string, token: string, id: string): Promise<CancelTerminalInvoiceResponse> {
+  return terminalRequest(token, `/${nym}/pos/invoices/${id}/cancel`, { method: 'POST' })
 }

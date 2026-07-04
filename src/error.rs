@@ -25,6 +25,16 @@ pub enum AppError {
     /// invoice's owning nym. Same wire copy in both cases — never reveal
     /// existence cross-nym.
     InvoiceNotFound(String),
+    /// Terminal ID does not resolve, or the signing npub does not own it.
+    /// Same wire copy in both cases — never reveal existence cross-owner.
+    TerminalNotFound(String),
+    /// POS terminal invoice attempted before the wallet provisioned the
+    /// nym's dedicated POS settlement descriptor.
+    PosDescriptorRequired(String),
+    /// `pos-pair` claim carried a descriptor that differs from the one
+    /// already stored for the nym. The stored descriptor is never
+    /// overwritten — a swap would redirect terminal settlement funds.
+    PosDescriptorMismatch(String),
     /// Image upload rejected (magic-byte sniff fail, decode error, etc.).
     /// Inner string is operator-facing.
     ImageInvalid(String),
@@ -78,6 +88,8 @@ pub enum AppError {
     /// already assigned to an invoice. Address reuse makes chain payment
     /// attribution ambiguous, so it is rejected at create time.
     LiquidAddressAlreadyUsed,
+    /// Terminal cancel attempted after any payment signal was observed.
+    InvoicePaymentAlreadyDetected,
 
     // --- Capacity / rate-limit ---
     /// One source (IP, pubkey, etc.) is making too many requests.
@@ -90,6 +102,9 @@ pub enum AppError {
     BackendThrottled,
     /// Recipient has too many in-flight payment reservations.
     TooManyPendingReservations,
+    /// POS pairing failed-claim bucket is full. HTTP 429, unlike the
+    /// LNURL-compatible soft rate-limit variants above.
+    PosPairingClaimRateLimited,
     /// Hard ceiling reached (e.g. `max_active_users`). Durable, not burst —
     /// clients should not retry-with-backoff. Internal `_reason` is for logs.
     ServiceUnavailable(String),
@@ -146,6 +161,9 @@ impl AppError {
             | Self::DonationPageInvalid(_)
             | Self::DonationPageNotFound(_)
             | Self::InvoiceNotFound(_)
+            | Self::TerminalNotFound(_)
+            | Self::PosDescriptorRequired(_)
+            | Self::PosDescriptorMismatch(_)
             | Self::ImageInvalid(_)
             | Self::ImageDimensionsTooLarge { .. }
             | Self::ImagePixelsTooLarge { .. }
@@ -160,13 +178,15 @@ impl AppError {
             | Self::PubkeyUtxoMismatch
             | Self::InvalidAmount(_)
             | Self::BitcoinAddressAlreadyUsed
-            | Self::LiquidAddressAlreadyUsed => ErrorClass::Identity,
+            | Self::LiquidAddressAlreadyUsed
+            | Self::InvoicePaymentAlreadyDetected => ErrorClass::Identity,
 
             Self::RateLimitedSender
             | Self::RateLimitedRecipient
             | Self::RateLimitedNetwork
             | Self::BackendThrottled
-            | Self::TooManyPendingReservations => ErrorClass::RateLimit,
+            | Self::TooManyPendingReservations
+            | Self::PosPairingClaimRateLimited => ErrorClass::RateLimit,
 
             Self::ServiceUnavailable(_) | Self::PurgeBlocked(_) => ErrorClass::Capacity,
 
@@ -188,6 +208,9 @@ impl AppError {
             Self::DonationPageInvalid(_) => "DonationPageInvalid",
             Self::DonationPageNotFound(_) => "DonationPageNotFound",
             Self::InvoiceNotFound(_) => "InvoiceNotFound",
+            Self::TerminalNotFound(_) => "TerminalNotFound",
+            Self::PosDescriptorRequired(_) => "PosDescriptorRequired",
+            Self::PosDescriptorMismatch(_) => "PosDescriptorMismatch",
             Self::ImageInvalid(_) => "ImageInvalid",
             Self::ImageDimensionsTooLarge { .. } => "ImageDimensionsTooLarge",
             Self::ImagePixelsTooLarge { .. } => "ImagePixelsTooLarge",
@@ -206,12 +229,14 @@ impl AppError {
             Self::InvalidAmount(_) => "InvalidAmount",
             Self::BitcoinAddressAlreadyUsed => "BitcoinAddressAlreadyUsed",
             Self::LiquidAddressAlreadyUsed => "LiquidAddressAlreadyUsed",
+            Self::InvoicePaymentAlreadyDetected => "InvoicePaymentAlreadyDetected",
 
             Self::RateLimitedSender => "RateLimitedSender",
             Self::RateLimitedRecipient => "RateLimitedRecipient",
             Self::RateLimitedNetwork => "RateLimitedNetwork",
             Self::BackendThrottled => "BackendThrottled",
             Self::TooManyPendingReservations => "TooManyPendingReservations",
+            Self::PosPairingClaimRateLimited => "PosPairingClaimRateLimited",
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::PurgeBlocked(_) => "PurgeBlocked",
 
@@ -241,6 +266,13 @@ impl std::fmt::Display for AppError {
             Self::DonationPageInvalid(reason) => write!(f, "donation page invalid: {reason}"),
             Self::DonationPageNotFound(nym) => write!(f, "no donation page for {nym}"),
             Self::InvoiceNotFound(id) => write!(f, "invoice not found: {id}"),
+            Self::TerminalNotFound(id) => write!(f, "terminal not found: {id}"),
+            Self::PosDescriptorRequired(nym) => {
+                write!(f, "POS descriptor is required for terminal invoices: {nym}")
+            }
+            Self::PosDescriptorMismatch(nym) => {
+                write!(f, "POS descriptor does not match the stored one for {nym}")
+            }
             Self::ImageInvalid(reason) => write!(f, "image invalid: {reason}"),
             Self::ImageDimensionsTooLarge { max } => {
                 write!(f, "image dimensions exceed {max}px cap")
@@ -269,12 +301,16 @@ impl std::fmt::Display for AppError {
             Self::InvalidAmount(reason) => write!(f, "invalid amount: {reason}"),
             Self::BitcoinAddressAlreadyUsed => write!(f, "bitcoin address already used"),
             Self::LiquidAddressAlreadyUsed => write!(f, "liquid address already used"),
+            Self::InvoicePaymentAlreadyDetected => {
+                write!(f, "payment already detected; cannot cancel")
+            }
 
             Self::RateLimitedSender => write!(f, "rate limited (sender)"),
             Self::RateLimitedRecipient => write!(f, "rate limited (recipient)"),
             Self::RateLimitedNetwork => write!(f, "rate limited (network)"),
             Self::BackendThrottled => write!(f, "backend throttled"),
             Self::TooManyPendingReservations => write!(f, "too many pending reservations"),
+            Self::PosPairingClaimRateLimited => write!(f, "pos pairing claim rate limited"),
             Self::ServiceUnavailable(r) => write!(f, "service unavailable: {r}"),
             Self::PurgeBlocked(n) => write!(f, "purge blocked: {n} in-flight swap(s)"),
 
@@ -310,6 +346,13 @@ impl IntoResponse for AppError {
             AppError::DonationPageInvalid(reason) => format!("Donation page rejected: {reason}."),
             AppError::DonationPageNotFound(_) => "No donation page exists for this name.".into(),
             AppError::InvoiceNotFound(_) => "Invoice not found.".into(),
+            AppError::TerminalNotFound(_) => "Terminal not found.".into(),
+            AppError::PosDescriptorRequired(_) => {
+                "POS settlement wallet is not provisioned for this payment page.".into()
+            }
+            AppError::PosDescriptorMismatch(_) => {
+                "This name already has a POS settlement wallet and the pairing request was signed for a different one. The stored wallet is never replaced.".into()
+            }
             AppError::ImageInvalid(_) => "Image was rejected. Use a JPEG, PNG, or WebP file under 2 MB.".into(),
             AppError::ImageDimensionsTooLarge { max } => format!(
                 "Image dimensions are too large. Maximum {max}×{max} pixels."
@@ -344,12 +387,16 @@ impl IntoResponse for AppError {
             AppError::LiquidAddressAlreadyUsed => {
                 "This Liquid address is already assigned to an invoice. Generate a fresh receive address and try again.".into()
             }
+            AppError::InvoicePaymentAlreadyDetected => {
+                "Payment already detected — cannot cancel this invoice.".into()
+            }
 
             AppError::RateLimitedSender => "Request rate limit exceeded for this source. Retry later.".into(),
             AppError::RateLimitedRecipient => "This Lightning Address has reached its request rate limit on the server. Retry later.".into(),
             AppError::RateLimitedNetwork => "Too many distinct wallets have used this service from this network. Retry later, or switch networks.".into(),
             AppError::BackendThrottled => "Liquid network backend is rate-limited. Retry later.".into(),
             AppError::TooManyPendingReservations => "This Lightning Address has reached the maximum number of unfulfilled payment reservations. Retry once existing reservations complete or expire.".into(),
+            AppError::PosPairingClaimRateLimited => "Too many failed pairing attempts from this source. Retry later.".into(),
             AppError::ServiceUnavailable(reason) => {
                 if reason.contains("active user ceiling") {
                     "The maximum number of registered users has been reached. New registrations are not being accepted.".into()
@@ -391,10 +438,11 @@ impl IntoResponse for AppError {
         // endpoints for consistency. Auth: 401. Hard ceiling: 503.
         let status = match &self {
             AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
-            AppError::BitcoinAddressAlreadyUsed | AppError::LiquidAddressAlreadyUsed => {
-                StatusCode::CONFLICT
-            }
+            AppError::BitcoinAddressAlreadyUsed
+            | AppError::LiquidAddressAlreadyUsed
+            | AppError::PosDescriptorMismatch(_) => StatusCode::CONFLICT,
             AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::PosPairingClaimRateLimited => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::OK,
         };
 

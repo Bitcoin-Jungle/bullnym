@@ -104,23 +104,12 @@ UPDATE clauses.
 Update `PUT /donation-page/:nym` handler and the bullpay-la-v2 signing field list
 (add `"pos_mode"` as a signable field).
 
-## Invoice list endpoint for history (optional, later)
+## POS terminal capability
 
-For the POS transaction history sheet, the PWA could call a public per-nym invoice
-list endpoint. This doesn't exist yet in the anonymous path — the signed
-`GET /api/v1/invoices?npub=...` exists for the wallet.
-
-Options:
-1. PWA uses the signed endpoint — requires Bull Wallet to issue a session token (deferred)
-2. Add `GET /<nym>/invoices` — public, returns last N invoices for that nym,
-   rate-limited, no amounts (status + paid_at + rail only for privacy)
-3. PWA maintains its own local history in `localStorage` from invoices it created —
-   no new endpoint needed, good enough for v1
-
-**Recommendation:** Option 3 for v1. localStorage keyed by nym, stores invoice IDs
-and amounts the PWA itself created. On each poll-to-paid, update the local record.
-History survives page refreshes but not browser clears. Full server-backed history
-is a v1.1 feature via Bull Wallet auth.
+Server-authoritative POS terminals are implemented. Pairing, bearer-token
+terminal auth, memo-bearing terminal invoice creation, terminal invoice history,
+terminal cancellation, wallet terminal listing, and wallet revocation are covered
+by the contract in `docs/features/pos-terminals.md`.
 
 ## No other backend changes
 

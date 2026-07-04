@@ -10,6 +10,7 @@ import { derivePayView, isTerminalView, showsRails, payViewLabel, shouldRefreshL
 function makeStatus(overrides: Partial<InvoiceStatus> = {}): InvoiceStatus {
   return {
     status: 'unpaid',
+    memo: null,
     pricing_mode: 'fiat',
     settlement_status: 'none',
     amount_sat: 10_800,
